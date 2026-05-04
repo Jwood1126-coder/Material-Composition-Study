@@ -30,22 +30,26 @@ jobs:
 
       - name: Build Windows EXE with PyInstaller
         run: |
-          pyinstaller --onefile --name analyze_materials --console analyze_materials.py
+          pyinstaller --onefile --windowed --name MaterialCompositionAnalyzer analyze_materials.py
 
-      - name: Smoke-test the binary
+      - name: Smoke-test the binary (CLI --help should exit cleanly)
         shell: pwsh
         run: |
-          dist\analyze_materials.exe --help
+          # --windowed apps don't print to the parent console on Windows, but
+          # we can at least verify the EXE launches without error and exits.
+          $proc = Start-Process -FilePath "dist\MaterialCompositionAnalyzer.exe" `
+                                -ArgumentList "--help" -PassThru -Wait
+          if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
 
       - name: Upload EXE as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: analyze_materials-windows
-          path: dist/analyze_materials.exe
+          name: MaterialCompositionAnalyzer-windows
+          path: dist/MaterialCompositionAnalyzer.exe
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/analyze_materials.exe
+          files: dist/MaterialCompositionAnalyzer.exe
           generate_release_notes: true

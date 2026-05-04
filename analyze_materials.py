@@ -27,11 +27,20 @@ Sanity / data-quality guards baked in:
   - Boolean flag columns clearly separated from informational notes
 """
 
+import os
 import re
 import sys
 import argparse
 from pathlib import Path
 from datetime import datetime
+
+# In PyInstaller --windowed builds on Windows, stdout/stderr are None.
+# Redirect to devnull so print() calls don't crash; CLI usage from a real
+# terminal is unaffected because stdout/stderr exist there.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
 import pandas as pd
 
@@ -650,9 +659,7 @@ def load_csv(path: Path, encoding: str) -> pd.DataFrame:
         return df
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-
+def run_cli(args) -> None:
     csv_path = Path(args.input)
     if not csv_path.exists():
         print(f"ERROR: File not found: {csv_path}")
@@ -667,7 +674,6 @@ def main() -> None:
         print(f"ERROR: {exc}")
         sys.exit(1)
 
-    # Resolve name column for display
     col_map  = {c.lower(): c for c in df_result.columns}
     col_name = next(
         (col_map[k] for k in ("name", "item name", "item_name") if k in col_map),
@@ -685,6 +691,215 @@ def main() -> None:
 
     if args.excel:
         export_excel(df_result, args.excel)
+
+
+# ── GUI ────────────────────────────────────────────────────────────────────────
+
+def run_gui() -> None:
+    """Simple tkinter GUI: pick CSV, click Analyze, get an Excel report."""
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    import threading
+    import subprocess
+    import os
+
+    root = tk.Tk()
+    root.title("Material Composition Analyzer")
+    root.geometry("620x480")
+    root.minsize(540, 420)
+
+    state = {"csv_path": None, "xlsx_path": None}
+
+    # ── Layout ─────────────────────────────────────────────────────────────
+    main_frame = ttk.Frame(root, padding=20)
+    main_frame.pack(fill="both", expand=True)
+
+    title_lbl = ttk.Label(
+        main_frame,
+        text="NetSuite Material Composition Analyzer",
+        font=("Segoe UI", 14, "bold"),
+    )
+    title_lbl.pack(anchor="w")
+
+    subtitle_lbl = ttk.Label(
+        main_frame,
+        text="Select a CSV exported from your NetSuite saved search, then click Analyze.",
+        foreground="#555555",
+    )
+    subtitle_lbl.pack(anchor="w", pady=(2, 16))
+
+    # File picker row
+    file_frame = ttk.LabelFrame(main_frame, text="Input CSV", padding=10)
+    file_frame.pack(fill="x")
+
+    file_lbl = ttk.Label(file_frame, text="(no file selected)", foreground="#888888")
+    file_lbl.pack(side="left", fill="x", expand=True)
+
+    def pick_file():
+        path = filedialog.askopenfilename(
+            title="Select NetSuite CSV export",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            state["csv_path"] = path
+            file_lbl.config(text=Path(path).name, foreground="#000000")
+            analyze_btn.config(state="normal")
+            status_lbl.config(text="Ready to analyze.", foreground="#000000")
+
+    pick_btn = ttk.Button(file_frame, text="Choose CSV…", command=pick_file)
+    pick_btn.pack(side="right", padx=(10, 0))
+
+    # Status / summary area
+    status_frame = ttk.LabelFrame(main_frame, text="Status", padding=10)
+    status_frame.pack(fill="both", expand=True, pady=(16, 0))
+
+    status_lbl = ttk.Label(
+        status_frame,
+        text="Choose a CSV file to begin.",
+        foreground="#555555",
+    )
+    status_lbl.pack(anchor="w")
+
+    summary_text = tk.Text(
+        status_frame,
+        height=10,
+        wrap="word",
+        state="disabled",
+        font=("Consolas", 10),
+        background="#f7f7f7",
+        relief="flat",
+    )
+    summary_text.pack(fill="both", expand=True, pady=(8, 0))
+
+    progress = ttk.Progressbar(main_frame, mode="indeterminate")
+
+    # Action buttons
+    btn_frame = ttk.Frame(main_frame)
+    btn_frame.pack(fill="x", pady=(12, 0))
+
+    def open_path(path: str):
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=False)
+            else:
+                subprocess.run(["xdg-open", path], check=False)
+        except Exception as exc:
+            messagebox.showerror("Couldn't open", str(exc))
+
+    open_file_btn = ttk.Button(
+        btn_frame,
+        text="Open Excel Report",
+        command=lambda: open_path(state["xlsx_path"]) if state["xlsx_path"] else None,
+        state="disabled",
+    )
+    open_folder_btn = ttk.Button(
+        btn_frame,
+        text="Open Folder",
+        command=lambda: open_path(str(Path(state["xlsx_path"]).parent)) if state["xlsx_path"] else None,
+        state="disabled",
+    )
+
+    def set_summary(text: str):
+        summary_text.config(state="normal")
+        summary_text.delete("1.0", "end")
+        summary_text.insert("1.0", text)
+        summary_text.config(state="disabled")
+
+    def do_analyze():
+        csv_path = state["csv_path"]
+        if not csv_path:
+            return
+
+        analyze_btn.config(state="disabled")
+        pick_btn.config(state="disabled")
+        open_file_btn.config(state="disabled")
+        open_folder_btn.config(state="disabled")
+        progress.pack(fill="x", pady=(10, 0))
+        progress.start(10)
+        status_lbl.config(text="Analyzing… please wait.", foreground="#000000")
+        set_summary("")
+
+        def worker():
+            try:
+                csv_p = Path(csv_path)
+                df_raw = load_csv(csv_p, "utf-8-sig")
+                df_result = analyze_dataframe(df_raw)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                xlsx_p = csv_p.with_name(f"{csv_p.stem}_analysis_{timestamp}.xlsx")
+                export_excel(df_result, str(xlsx_p))
+
+                total   = len(df_result)
+                flagged = int(df_result["any_flag"].sum())
+                pct     = flagged / total * 100 if total else 0.0
+
+                lines = [
+                    f"Analyzed:       {total:,} records",
+                    f"With issues:    {flagged:,}  ({pct:.1f}%)",
+                    f"Clean:          {total - flagged:,}",
+                    "",
+                    "Issue breakdown:",
+                ]
+                for col, label in FLAG_META.items():
+                    if col in df_result.columns:
+                        cnt = int(df_result[col].sum())
+                        marker = "  !" if cnt > 0 else "   "
+                        lines.append(f"{marker} {label:<48} {cnt:>6,}")
+                lines += ["", f"Saved to:  {xlsx_p.name}"]
+
+                state["xlsx_path"] = str(xlsx_p)
+
+                def on_done():
+                    progress.stop()
+                    progress.pack_forget()
+                    set_summary("\n".join(lines))
+                    status_lbl.config(text="Done.", foreground="#006600")
+                    analyze_btn.config(state="normal")
+                    pick_btn.config(state="normal")
+                    open_file_btn.config(state="normal")
+                    open_folder_btn.config(state="normal")
+                root.after(0, on_done)
+
+            except Exception as exc:
+                err_msg = str(exc)
+                def on_err():
+                    progress.stop()
+                    progress.pack_forget()
+                    status_lbl.config(text="Error.", foreground="#990000")
+                    set_summary(f"ERROR:\n\n{err_msg}")
+                    analyze_btn.config(state="normal")
+                    pick_btn.config(state="normal")
+                root.after(0, on_err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    analyze_btn = ttk.Button(
+        btn_frame,
+        text="Analyze and Save Excel",
+        command=do_analyze,
+        state="disabled",
+    )
+    analyze_btn.pack(side="left")
+    open_file_btn.pack(side="left", padx=(8, 0))
+    open_folder_btn.pack(side="left", padx=(8, 0))
+
+    quit_btn = ttk.Button(btn_frame, text="Close", command=root.destroy)
+    quit_btn.pack(side="right")
+
+    root.mainloop()
+
+
+def main() -> None:
+    # No CLI args → launch GUI (this is what double-clicking the .exe does).
+    if len(sys.argv) <= 1:
+        run_gui()
+        return
+
+    # Otherwise, parse CLI args as before.
+    args = build_parser().parse_args()
+    run_cli(args)
 
 
 if __name__ == "__main__":
