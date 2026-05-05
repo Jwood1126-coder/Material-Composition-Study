@@ -44,6 +44,8 @@ if sys.stderr is None:
 
 import pandas as pd
 
+__version__ = "1.5.0"
+
 try:
     import xlsxwriter
     from xlsxwriter.utility import xl_col_to_name
@@ -292,7 +294,14 @@ def analyze_dataframe(
     idx = df.index
 
     # ── Sanitize string fields (vectorized) ────────────────────────────────
-    sentinel_map = {"nan": "", "None": "", "NaN": "", "none": ""}
+    # Treat common placeholder text as missing — real NetSuite exports often
+    # contain these instead of true blanks.
+    sentinel_map = {
+        "nan": "", "NaN": "", "None": "", "none": "",
+        "tbd": "", "TBD": "", "n/a": "", "N/A": "", "na": "", "NA": "",
+        "unknown": "", "Unknown": "", "UNKNOWN": "",
+        "?": "", "—": "", "-": "",
+    }
     for col in filter(None, [col_id, col_name, col_class, col_material, col_mat_comp]):
         df[col] = (
             df[col]
@@ -332,7 +341,9 @@ def analyze_dataframe(
     expected_mat = expected_mat.mask(~has_ss & has_b_suffix, "Brass")
     expected_mat = expected_mat.mask(~has_ss & ~has_b_suffix & has_d_suffix, "Aluminum")
 
-    # Recommended material: suffix-derived, or "Steel" by default
+    # Initial recommendation — refined below once class_confirms is known.
+    # (suffix-derived material if any, else default to "Steel"; see refinement
+    # after class_confirms is computed)
     recommended_mat = expected_mat.where(expected_mat != "", "Steel")
 
     # ── Multi-composition + matrix parent detection ────────────────────────
@@ -384,6 +395,14 @@ def analyze_dataframe(
         )
         class_confirms = class_confirms | (substring_confirm & ~known_mat)
 
+    # ── Refine recommended_material now that class_confirms is known ───────
+    # If the class explicitly confirms the composition, recommend keeping the
+    # current Material Composition (not the suffix-derived material, and not
+    # the default Steel). This stops the report from saying "Recommended:
+    # Steel" on rows that are already correct (e.g., a Nylon part with
+    # "Industrial Fittings - Nylon" class).
+    recommended_mat = recommended_mat.where(~class_confirms, matc)
+
     report(0.30, "Checking suffix rules…")
 
     # ── FLAG: empty material composition ───────────────────────────────────
@@ -424,7 +443,10 @@ def analyze_dataframe(
     class_note_text = pd.Series([""] * n, index=idx, dtype=object)
 
     if "flag_class_material_mismatch" in enabled_checks:
-        eligible = ~is_bb_flag & (matc_lower != "")
+        # Blank class is a separate data-quality issue, not a class-mapping
+        # mismatch — exclude blank-class rows from this check so notes don't
+        # say "Class '' does not reflect: 'X'".
+        eligible = ~is_bb_flag & (matc_lower != "") & (klass_lower != "")
 
         # Vectorized single-composition path (the common case)
         single_eligible = eligible & ~has_multi_comp
@@ -594,6 +616,55 @@ def analyze_dataframe(
     notes = parts.str.replace(r"^ \| ", "", regex=True)
     notes = notes.where(notes != "", "OK")
 
+    # ── Suggested Fix column ───────────────────────────────────────────────
+    # Templated, actionable text per row. When multiple fixes apply we pick
+    # the most specific one (forward suffix > class > matrix > empty > soft).
+    fix = pd.Series([""] * n, index=idx, dtype=object)
+
+    # Forward suffix: composition is real, name is wrong → rename to add suffix
+    fix = fix.mask(
+        forward_mismatch,
+        "Either rename the part to match '" + matc + "' "
+        "OR change Material Composition to '" + expected_mat + "'"
+    )
+    # Reverse SS / Brass / Aluminum: missing suffix, class doesn't confirm
+    fix = fix.mask(
+        rev_ss_mismatch & (fix == ""),
+        "Verify composition: if part is plain Steel, change Material Composition. "
+        "If genuinely Stainless, add -SS to the name and update class."
+    )
+    fix = fix.mask(
+        rev_brass_mismatch & (fix == ""),
+        "Verify composition: if part is plain Steel, change Material Composition. "
+        "If genuinely Brass, add -B to the name and update class."
+    )
+    fix = fix.mask(
+        rev_alum_mismatch & (fix == ""),
+        "Verify composition: if part is plain Steel, change Material Composition. "
+        "If genuinely Aluminum, add -D to the name and update class."
+    )
+    # Class mismatch: composition is right, class is mis-categorized
+    fix = fix.mask(
+        flag_class & (fix == ""),
+        "Reclassify the item under a class containing '" + matc + "'"
+    )
+    # Matrix Material field disagreement
+    fix = fix.mask(
+        flag_matrix & (fix == ""),
+        "Update the matrix Material field to match the Material Composition"
+    )
+    # Missing composition
+    fix = fix.mask(
+        flag_empty & (fix == ""),
+        "Populate the Material Composition field"
+    )
+    # Soft no-suffix non-Steel (review)
+    fix = fix.mask(
+        flag_no_suffix_non_steel & (fix == ""),
+        "Confirm the composition is correct; if so, no action needed"
+    )
+    fix = fix.where(fix != "", "—")
+
     report(0.95, "Finalizing…")
 
     # ── Assemble result ────────────────────────────────────────────────────
@@ -608,6 +679,7 @@ def analyze_dataframe(
     result["recommended_material"]            = recommended_mat
     result["expected_material_from_name"]     = expected_mat
     result["analysis_notes"]                  = notes
+    result["suggested_fix"]                   = fix
     result["any_flag"]                        = any_flag.astype(bool)
 
     report(1.0, "Analysis complete")
@@ -665,6 +737,7 @@ _C = {
 
 _FRIENDLY_NAMES: dict[str, str] = {
     "flag_suffix_mismatch":            "Suffix Mismatch",
+    "flag_no_suffix_non_steel":        "No-Suffix Non-Steel (Review)",
     "flag_class_material_mismatch":    "Class Mismatch",
     "flag_material_field_mismatch":    "Matrix Field Mismatch",
     "flag_empty_material_composition": "Missing Composition",
@@ -674,6 +747,7 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "recommended_material":            "Recommended Material",
     "expected_material_from_name":     "Suffix-Detected Material",
     "analysis_notes":                  "Analysis Notes",
+    "suggested_fix":                   "Suggested Fix",
 }
 
 
@@ -704,14 +778,12 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
                 pass
 
     # ── Column ordering ────────────────────────────────────────────────────
+    derived_cols   = ["recommended_material", "expected_material_from_name",
+                      "suggested_fix", "analysis_notes"]
     source_cols = [
         c for c in df.columns
-        if c not in FLAG_COLS + [
-            "any_flag", "expected_material_from_name", "analysis_notes",
-            "recommended_material",
-        ]
+        if c not in FLAG_COLS + ["any_flag"] + derived_cols
     ]
-    derived_cols   = ["recommended_material", "expected_material_from_name", "analysis_notes"]
     flag_disp_cols = [c for c in FLAG_COLS if c in df.columns] + ["any_flag"]
     ordered_cols   = source_cols + derived_cols + flag_disp_cols
 
@@ -800,17 +872,22 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
 
 def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
     ws = wb.add_worksheet("Summary")
-    ws.set_column(0, 0, 46)
-    ws.set_column(1, 1, 14)
+    ws.set_column(0, 0, 50)
+    ws.set_column(1, 1, 18)
 
     # Title banner
     ws.merge_range(0, 0, 0, 1, "NetSuite Material Composition Analysis", fmt["title"])
     ws.set_row(0, 36)
 
-    # Timestamp
+    # Provenance line: when, by whom, which version
+    try:
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+    except Exception:
+        user = "unknown"
     ws.merge_range(
         1, 0, 1, 1,
-        f"Generated: {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}   "
+        f"by: {user}   analyzer v{__version__}",
         fmt["subtle"]
     )
     ws.set_row(1, 18)
@@ -824,7 +901,7 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
         ("Clean Records",           f"{total - flagged:,}"),
         ("Issue Rate",              f"{flagged / total * 100:.1f}%" if total else "—"),
         ("", ""),
-        ("Issue Breakdown",         "Count"),
+        ("Issue Breakdown (a single row may be counted in multiple lines)", "Count"),
     ]
     for flag_col, label in FLAG_META.items():
         count = int(df[flag_col].sum()) if flag_col in df.columns else 0
@@ -835,7 +912,7 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
     bold_keys = {"Total Records Analyzed", "Records with Issues",
                  "Clean Records", "Issue Rate"}
     for label, value in summary_rows:
-        if label == "Issue Breakdown":
+        if label.startswith("Issue Breakdown"):
             ws.write(out_row, 0, label, fmt["section"])
             ws.write(out_row, 1, value, fmt["section"])
         elif label in bold_keys:
@@ -875,6 +952,8 @@ def _write_data_sheet_xlsx(ws, df: pd.DataFrame, fmt: dict, on_chunk_written) ->
     for col_idx, c in enumerate(col_names):
         if c == "analysis_notes":
             ws.set_column(col_idx, col_idx, 52, fmt["notes"])
+        elif c == "suggested_fix":
+            ws.set_column(col_idx, col_idx, 60, fmt["notes"])
         elif col_idx in flag_positions:
             ws.set_column(col_idx, col_idx, 16, fmt["center"])
         elif c in ("recommended_material", "expected_material_from_name"):
