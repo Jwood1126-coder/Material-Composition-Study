@@ -78,6 +78,7 @@ MATERIAL_CLASS_KEYWORDS: dict[str, list[str]] = {
 SUFFIX_MATERIAL_MAP: dict[str, str] = {
     "SS": "Stainless Steel",
     "B":  "Brass",
+    "D":  "Aluminum",
 }
 
 # Segments that look like a suffix but are NOT material indicators.
@@ -86,9 +87,8 @@ NON_MATERIAL_SEGMENTS: set[str] = {
     "BB",   # Brennan Black program
     "LW",   # Light weight — structural modifier, not material
     "SPL",  # Special
-    "D",    # Size/dimension indicator
     "UNP",  # Unpainted
-    "ZN",   # Zinc plated — note: treated separately if needed
+    "ZN",   # Zinc plated
 }
 
 # Classes that are explicitly exempt from the "class must contain material" check.
@@ -134,6 +134,7 @@ def detect_suffix_material(name: str) -> str | None:
         (handles -SS-LW, -SS-SPL, etc. — SS anywhere still means stainless)
       - Final segment == 'B' exactly → Brass
         (-BB is NOT brass; exact match guards against this)
+      - Final segment == 'D' exactly → Aluminum
 
     Returns the canonical material string, or None if no suffix match.
     """
@@ -145,9 +146,11 @@ def detect_suffix_material(name: str) -> str | None:
     if "SS" in segments:
         return "Stainless Steel"
 
-    # B must be the final segment and must be EXACTLY 'B'
+    # B / D must be the final segment exactly (no partial collisions like BB)
     if segments[-1] == "B":
         return "Brass"
+    if segments[-1] == "D":
+        return "Aluminum"
 
     return None
 
@@ -319,11 +322,13 @@ def analyze_dataframe(
     has_bb        = segments.map(lambda s: "BB" in s)
     last_seg      = segments.map(lambda s: s[-1] if s else "")
     has_b_suffix  = (last_seg == "B")    # exact -B (not -BB)
+    has_d_suffix  = (last_seg == "D")    # exact -D → Aluminum
 
-    # Expected material from suffix
+    # Expected material from suffix (priority: SS > B > D)
     expected_mat = pd.Series([""] * n, index=idx, dtype=object)
     expected_mat = expected_mat.mask(has_ss, "Stainless Steel")
     expected_mat = expected_mat.mask(~has_ss & has_b_suffix, "Brass")
+    expected_mat = expected_mat.mask(~has_ss & ~has_b_suffix & has_d_suffix, "Aluminum")
 
     # Recommended material: suffix-derived, or "Steel" by default
     recommended_mat = expected_mat.where(expected_mat != "", "Steel")
@@ -343,6 +348,36 @@ def analyze_dataframe(
     is_bb_flag  = has_bb | is_bb_class
     is_empty    = (matc_lower == "")
 
+    # ── Class keyword extraction (used by both class check and class_confirms) ──
+    contains_stainless = klass_lower.str.contains("stainless", na=False)
+    contains_steel     = klass_lower.str.contains("steel",     na=False)
+    contains_brass     = klass_lower.str.contains("brass",     na=False)
+    contains_alum      = klass_lower.str.contains(r"alumin(?:um|ium)", regex=True, na=False)
+
+    # Class confirms the material composition?
+    # Used to suppress the *reverse* suffix and "no-suffix non-Steel" flags
+    # — if the class explicitly names the material, the composition is taken
+    # to be correct and a missing/odd suffix doesn't warrant a rename suggestion.
+    is_alum_comp = matc_lower.isin(["aluminum", "aluminium", "aluminum alloy"])
+    class_confirms = (
+          ((matc_lower == "stainless steel") & contains_stainless)
+        | ((matc_lower == "steel") & contains_steel & ~contains_stainless)
+        | ((matc_lower == "brass") & contains_brass)
+        | (is_alum_comp & contains_alum)
+    )
+    # Generic substring fallback: any non-empty composition whose lowercased
+    # form appears verbatim in the class name (e.g. "Nylon" in "...P.T.C - Nylon").
+    # Only relevant for materials not in the known list above.
+    known_mat = matc_lower.isin([
+        "stainless steel", "steel", "brass", "aluminum", "aluminium", "aluminum alloy"
+    ])
+    if (~known_mat & (matc_lower != "")).any():
+        substring_confirm = pd.Series(
+            [m and m in c for m, c in zip(matc_lower, klass_lower)],
+            index=idx,
+        )
+        class_confirms = class_confirms | (substring_confirm & ~known_mat)
+
     report(0.30, "Checking suffix rules…")
 
     # ── FLAG: empty material composition ───────────────────────────────────
@@ -352,21 +387,29 @@ def analyze_dataframe(
         flag_empty = pd.Series([False] * n, index=idx)
 
     # ── FLAG: suffix mismatch (bidirectional) ──────────────────────────────
+    # Forward mismatch (suffix actively contradicts the composition) is ALWAYS
+    # flagged. Reverse mismatch (composition needs a suffix the name lacks) is
+    # SUPPRESSED when the class confirms the material — the data is consistent
+    # with the rest of the record so the part name is the odd one out, but it
+    # may be intentional and shouldn't trigger an alarm.
     expected_lower  = expected_mat.str.lower()
     forward_mismatch = (
         (expected_mat != "") & (matc_lower != "") & (expected_lower != matc_lower)
     )
     is_single = ~has_multi_comp & ~is_matrix_parent
-    rev_ss_mismatch    = is_single & (matc_lower == "stainless steel") & ~has_ss
-    rev_brass_mismatch = is_single & (matc_lower == "brass") & ~has_b_suffix
+
+    rev_ss_mismatch    = is_single & (matc_lower == "stainless steel") & ~has_ss & ~class_confirms
+    rev_brass_mismatch = is_single & (matc_lower == "brass") & ~has_b_suffix & ~class_confirms
+    rev_alum_mismatch  = is_single & is_alum_comp & ~has_d_suffix & ~class_confirms
 
     if "flag_suffix_mismatch" in enabled_checks:
-        flag_suffix = forward_mismatch | rev_ss_mismatch | rev_brass_mismatch
+        flag_suffix = forward_mismatch | rev_ss_mismatch | rev_brass_mismatch | rev_alum_mismatch
     else:
         flag_suffix = pd.Series([False] * n, index=idx)
         forward_mismatch    = pd.Series([False] * n, index=idx)
         rev_ss_mismatch     = pd.Series([False] * n, index=idx)
         rev_brass_mismatch  = pd.Series([False] * n, index=idx)
+        rev_alum_mismatch   = pd.Series([False] * n, index=idx)
 
     report(0.50, "Checking class consistency…")
 
@@ -380,10 +423,7 @@ def analyze_dataframe(
         # Vectorized single-composition path (the common case)
         single_eligible = eligible & ~has_multi_comp
 
-        contains_stainless = klass_lower.str.contains("stainless", na=False)
-        contains_steel     = klass_lower.str.contains("steel",     na=False)
-        contains_brass     = klass_lower.str.contains("brass",     na=False)
-        contains_alum      = klass_lower.str.contains(r"alumin(?:um|ium)", regex=True, na=False)
+        # (contains_* keyword masks were already computed above for class_confirms)
 
         # Stainless Steel composition: class needs "stainless"
         ss_mat = single_eligible & (matc_lower == "stainless steel")
@@ -469,9 +509,11 @@ def analyze_dataframe(
             multi_mismatch = df[multi_eligible].apply(_multi_member, axis=1)
             flag_matrix.loc[multi_mismatch.index] |= multi_mismatch.fillna(False)
 
-    # ── INFO: no suffix → non-Steel composition (suppressed if suffix flag) ─
+    # ── INFO: no suffix → non-Steel composition (suppressed if suffix flag
+    # already fires, OR the class explicitly confirms the material) ─────
     flag_no_suffix_non_steel = (
-        (expected_mat == "") & (matc_lower != "") & (matc_lower != "steel") & ~flag_suffix
+        (expected_mat == "") & (matc_lower != "") & (matc_lower != "steel")
+        & ~flag_suffix & ~class_confirms
     )
 
     # any_flag = OR of issue flags only
@@ -494,12 +536,13 @@ def analyze_dataframe(
         )
         parts = parts.mask(forward_mismatch, parts + SEP + fwd_text)
 
-        # Reverse SS
+        # Reverse SS — name lacks -SS for a Stainless Steel composition,
+        # and the class doesn't confirm Stainless either
         parts = parts.mask(
             rev_ss_mismatch,
             parts + SEP +
             "Material Composition is 'Stainless Steel' but name has no -SS suffix "
-            "(likely should be Steel)"
+            "and class doesn't confirm — composition may actually be Steel"
         )
 
         # Reverse Brass
@@ -507,7 +550,15 @@ def analyze_dataframe(
             rev_brass_mismatch,
             parts + SEP +
             "Material Composition is 'Brass' but name does not end in -B "
-            "(likely should be Steel)"
+            "and class doesn't confirm — composition may actually be Steel"
+        )
+
+        # Reverse Aluminum
+        parts = parts.mask(
+            rev_alum_mismatch,
+            parts + SEP +
+            "Material Composition is 'Aluminum' but name does not end in -D "
+            "and class doesn't confirm — composition may actually be Steel"
         )
 
     if "flag_class_material_mismatch" in enabled_checks:
@@ -673,20 +724,11 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
     # Mask of issue rows (drives conditional row-fill rule)
     issue_mask = df["any_flag"].astype(bool).values
 
-    # ── Sheet plan ─────────────────────────────────────────────────────────
-    flagged_disp = display_df[issue_mask]
+    # ── Sheet plan: Summary + a single Detail sheet (with autofilter so the
+    # user can isolate Has Issue=YES or any individual flag column) ────────
     sheet_plan: list[tuple[str, pd.DataFrame, "any"]] = [
-        ("All Data",      display_df,  issue_mask),
-        ("Flagged Items", flagged_disp, issue_mask[issue_mask]),
+        ("Detail", display_df, issue_mask),
     ]
-    # Per-flag sheets only when count > 0 AND not too large (avoid duplicate bulk)
-    for flag_col, label in FLAG_META.items():
-        if flag_col not in df.columns:
-            continue
-        m = df[flag_col].astype(bool).values
-        cnt = int(m.sum())
-        if cnt > 0 and cnt <= 20_000:
-            sheet_plan.append((label[:31], display_df[m], issue_mask[m]))
 
     total_rows = sum(len(sub) for _, sub, _ in sheet_plan) or 1
     written = [0]
