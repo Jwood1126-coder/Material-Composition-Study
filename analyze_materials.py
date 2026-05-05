@@ -656,10 +656,19 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
     display_df = df[ordered_cols].copy()
     for c in flag_disp_cols:
         display_df[c] = display_df[c].map({True: "YES", False: "—"}).fillna("—")
-    # Ensure all object cells are str (no NaN going to Excel)
+    # Ensure no NaN/Inf reaches xlsxwriter (which rejects them by default).
+    # Object columns → empty string; numeric NaN/±Inf → empty string too,
+    # which forces the column to object dtype but is harmless.
+    import numpy as _np
     for c in display_df.columns:
-        if display_df[c].dtype == object:
-            display_df[c] = display_df[c].fillna("").astype(str)
+        col = display_df[c]
+        if col.dtype == object:
+            display_df[c] = col.fillna("").astype(str)
+        else:
+            display_df[c] = (
+                col.replace([_np.inf, -_np.inf], _np.nan)
+                   .where(col.notna(), "")
+            )
 
     # Mask of issue rows (drives conditional row-fill rule)
     issue_mask = df["any_flag"].astype(bool).values
@@ -690,7 +699,10 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
 
     # ── Workbook + reusable formats ────────────────────────────────────────
     report(0.04, "Initializing workbook…")
-    wb = xlsxwriter.Workbook(output_path, {"constant_memory": True})
+    wb = xlsxwriter.Workbook(output_path, {
+        "constant_memory":    True,
+        "nan_inf_to_errors":  True,    # graceful fallback if a NaN slips through
+    })
 
     fmt = {
         "title":      wb.add_format({
@@ -980,8 +992,8 @@ def run_gui() -> None:
 
     root = tk.Tk()
     root.title("Material Composition Analyzer")
-    root.geometry("620x480")
-    root.minsize(540, 420)
+    root.geometry("660x680")
+    root.minsize(600, 620)
 
     state = {"csv_path": None, "xlsx_path": None}
 
@@ -1064,9 +1076,23 @@ def run_gui() -> None:
                command=lambda: set_scope("class"),
                width=12).pack(side="left", padx=(6, 0))
 
-    # Status / summary area
+    # ── Layout: pack the action buttons to the BOTTOM first so they're
+    # always visible no matter how cramped the rest of the window gets.
+    # Then pack the progress bar / label just above (when shown), and let
+    # the status area expand to fill the remaining middle space.
+
+    btn_frame = ttk.Frame(main_frame)
+    btn_frame.pack(side="bottom", fill="x", pady=(12, 0))
+
+    # Determinate progress bar with live percentage / phase message label
+    # (created here, packed dynamically just above btn_frame when analyze runs)
+    progress_lbl = ttk.Label(main_frame, text="", foreground="#444444",
+                              font=("Segoe UI", 9))
+    progress = ttk.Progressbar(main_frame, mode="determinate", maximum=100)
+
+    # Status / summary area — fills the middle, pushes against btn_frame
     status_frame = ttk.LabelFrame(main_frame, text="Status", padding=10)
-    status_frame.pack(fill="both", expand=True, pady=(12, 0))
+    status_frame.pack(side="top", fill="both", expand=True, pady=(12, 0))
 
     status_lbl = ttk.Label(
         status_frame,
@@ -1077,7 +1103,7 @@ def run_gui() -> None:
 
     summary_text = tk.Text(
         status_frame,
-        height=10,
+        height=8,
         wrap="word",
         state="disabled",
         font=("Consolas", 10),
@@ -1085,15 +1111,6 @@ def run_gui() -> None:
         relief="flat",
     )
     summary_text.pack(fill="both", expand=True, pady=(8, 0))
-
-    # Determinate progress bar with live percentage / phase message label
-    progress = ttk.Progressbar(main_frame, mode="determinate", maximum=100)
-    progress_lbl = ttk.Label(main_frame, text="", foreground="#444444",
-                              font=("Segoe UI", 9))
-
-    # Action buttons
-    btn_frame = ttk.Frame(main_frame)
-    btn_frame.pack(fill="x", pady=(12, 0))
 
     def open_path(path: str):
         try:
@@ -1134,8 +1151,11 @@ def run_gui() -> None:
         pick_btn.config(state="disabled")
         open_file_btn.config(state="disabled")
         open_folder_btn.config(state="disabled")
-        progress.pack(fill="x", pady=(10, 0))
-        progress_lbl.pack(fill="x")
+        # Pack progress widgets to the BOTTOM (just above btn_frame).
+        # Order matters with side=bottom — packed-first ends up lowest:
+        # we want label below the bar, so pack label first, then bar.
+        progress_lbl.pack(side="bottom", fill="x")
+        progress.pack(side="bottom", fill="x", pady=(10, 4))
         progress.config(value=0)
         progress_lbl.config(text="Starting…")
         status_lbl.config(text="Analyzing…", foreground="#000000")
