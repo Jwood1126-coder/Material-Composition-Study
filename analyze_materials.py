@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 try:
     import xlsxwriter
@@ -331,15 +331,15 @@ def analyze_dataframe(
     )
     has_ss        = segments.map(lambda s: "SS" in s)
     has_bb        = segments.map(lambda s: "BB" in s)
+    has_d         = segments.map(lambda s: "D" in s)   # D anywhere as own segment (e.g. -D-GREEN)
     last_seg      = segments.map(lambda s: s[-1] if s else "")
     has_b_suffix  = (last_seg == "B")    # exact -B (not -BB)
-    has_d_suffix  = (last_seg == "D")    # exact -D → Aluminum
 
     # Expected material from suffix (priority: SS > B > D)
     expected_mat = pd.Series([""] * n, index=idx, dtype=object)
     expected_mat = expected_mat.mask(has_ss, "Stainless Steel")
     expected_mat = expected_mat.mask(~has_ss & has_b_suffix, "Brass")
-    expected_mat = expected_mat.mask(~has_ss & ~has_b_suffix & has_d_suffix, "Aluminum")
+    expected_mat = expected_mat.mask(~has_ss & ~has_b_suffix & has_d, "Aluminum")
 
     # Initial recommendation — refined below once class_confirms is known.
     # (suffix-derived material if any, else default to "Steel"; see refinement
@@ -361,22 +361,30 @@ def analyze_dataframe(
     is_bb_flag  = has_bb | is_bb_class
     is_empty    = (matc_lower == "")
 
-    # ── Class keyword extraction (used by both class check and class_confirms) ──
+    # ── Class & name keyword extraction (used by class check and class_confirms) ─
+    name_lower = name.str.lower()
+
     contains_stainless = klass_lower.str.contains("stainless", na=False)
     contains_steel     = klass_lower.str.contains("steel",     na=False)
     contains_brass     = klass_lower.str.contains("brass",     na=False)
-    contains_alum      = klass_lower.str.contains(r"alumin(?:um|ium)", regex=True, na=False)
+    # "aerospace" classes → treat as Aluminum-confirming (industry context)
+    contains_alum      = klass_lower.str.contains(
+        r"alumin(?:um|ium)|aerospace", regex=True, na=False
+    )
+    # "ALUM" anywhere in the part name (e.g. ALUM VENT 3 FPT) also confirms Aluminum
+    name_says_alum = name_lower.str.contains(r"\balum", regex=True, na=False)
 
-    # Class confirms the material composition?
+    # Class (or name) confirms the material composition?
     # Used to suppress the *reverse* suffix and "no-suffix non-Steel" flags
-    # — if the class explicitly names the material, the composition is taken
-    # to be correct and a missing/odd suffix doesn't warrant a rename suggestion.
+    # — if the class or name explicitly names the material, the composition
+    # is taken to be correct and a missing/odd suffix doesn't warrant a
+    # rename suggestion.
     is_alum_comp = matc_lower.isin(["aluminum", "aluminium", "aluminum alloy"])
     class_confirms = (
           ((matc_lower == "stainless steel") & contains_stainless)
         | ((matc_lower == "steel") & contains_steel & ~contains_stainless)
         | ((matc_lower == "brass") & contains_brass)
-        | (is_alum_comp & contains_alum)
+        | (is_alum_comp & (contains_alum | name_says_alum))
     )
     # Generic substring fallback: any non-empty composition whose lowercased
     # form appears verbatim in the class name (e.g. "Nylon" in "...P.T.C - Nylon").
@@ -425,7 +433,7 @@ def analyze_dataframe(
 
     rev_ss_mismatch    = is_single & (matc_lower == "stainless steel") & ~has_ss & ~class_confirms
     rev_brass_mismatch = is_single & (matc_lower == "brass") & ~has_b_suffix & ~class_confirms
-    rev_alum_mismatch  = is_single & is_alum_comp & ~has_d_suffix & ~class_confirms
+    rev_alum_mismatch  = is_single & is_alum_comp & ~has_d & ~class_confirms
 
     if "flag_suffix_mismatch" in enabled_checks:
         flag_suffix = forward_mismatch | rev_ss_mismatch | rev_brass_mismatch | rev_alum_mismatch
