@@ -230,12 +230,21 @@ def _resolve_column(col_map: dict[str, str], *candidates: str) -> str | None:
     return None
 
 
-def analyze_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def analyze_dataframe(
+    df: pd.DataFrame,
+    enabled_checks: set[str] | None = None,
+) -> pd.DataFrame:
     """
     Main analysis entry point.
     Adds flag columns, 'expected_material_from_name', 'analysis_notes',
     and 'any_flag' to a copy of the input DataFrame.
+
+    enabled_checks : set of ISSUE_FLAGS keys to evaluate.
+                     None (default) → run all checks.
+                     Disabled checks are still listed as columns but always False.
     """
+    if enabled_checks is None:
+        enabled_checks = set(ISSUE_FLAGS.keys())
     df = df.copy()
 
     # ── Normalize column names ─────────────────────────────────────────────
@@ -310,21 +319,42 @@ def analyze_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             flags["flag_is_matrix_parent"] = True
 
         # ── Missing material composition ───────────────────────────────────
-        if not mat_comp:
+        if "flag_empty_material_composition" in enabled_checks and not mat_comp:
             flags["flag_empty_material_composition"] = True
             notes.append("Material Composition is blank")
 
-        # ── Suffix → material mismatch ─────────────────────────────────────
-        if expected_mat and mat_comp:
-            if normalize(expected_mat) != normalize(mat_comp):
+        # ── Suffix ↔ material mismatch (bidirectional) ─────────────────────
+        if "flag_suffix_mismatch" in enabled_checks and mat_comp:
+            segments = get_name_segments(name)
+            mat_norm = normalize(mat_comp)
+
+            # Forward: name suffix implies a material that disagrees with composition
+            if expected_mat and normalize(expected_mat) != mat_norm:
                 flags["flag_suffix_mismatch"] = True
                 notes.append(
                     f"Name suffix implies '{expected_mat}' "
                     f"but Material Composition is '{mat_comp}'"
                 )
 
+            # Reverse: composition is a suffix-required material but name has no
+            # such suffix. Skip multi-composition rows (matrix parents) where
+            # multiple materials legitimately coexist on one row.
+            elif len(compositions) == 1 and not flags["flag_is_matrix_parent"]:
+                if mat_norm == "stainless steel" and "SS" not in segments:
+                    flags["flag_suffix_mismatch"] = True
+                    notes.append(
+                        "Material Composition is 'Stainless Steel' but name has "
+                        "no -SS suffix (likely should be Steel)"
+                    )
+                elif mat_norm == "brass" and (not segments or segments[-1] != "B"):
+                    flags["flag_suffix_mismatch"] = True
+                    notes.append(
+                        "Material Composition is 'Brass' but name does not end "
+                        "in -B (likely should be Steel)"
+                    )
+
         # ── Class does not reflect material ────────────────────────────────
-        if mat_comp and not bb:
+        if "flag_class_material_mismatch" in enabled_checks and mat_comp and not bb:
             class_mismatches = [
                 comp for comp in compositions
                 if not material_matches_class(comp, class_val)
@@ -338,7 +368,7 @@ def analyze_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
         # ── Matrix Material field mismatch ─────────────────────────────────
         # Only evaluated when the Material field is populated (matrix part).
-        if material and mat_comp:
+        if "flag_material_field_mismatch" in enabled_checks and material and mat_comp:
             comp_normalized = [normalize(c) for c in compositions]
             if normalize(material) not in comp_normalized:
                 flags["flag_material_field_mismatch"] = True
@@ -350,7 +380,11 @@ def analyze_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         # ── No suffix → non-Steel composition (soft recommendation) ────────
         # Most suffix-less parts are plain Steel. Flag for review when they
         # have a different composition so a human can confirm it's intentional.
-        if not expected_mat and mat_comp and normalize(mat_comp) != "steel":
+        # Suppressed when flag_suffix_mismatch already fires for the same row
+        # (avoid double-flagging the SS/Brass cases now caught by the reverse rule).
+        if (not expected_mat and mat_comp
+                and normalize(mat_comp) != "steel"
+                and not flags["flag_suffix_mismatch"]):
             flags["flag_no_suffix_non_steel"] = True
             notes.append(
                 f"No material suffix — composition is '{mat_comp}' "
@@ -643,7 +677,35 @@ Examples:
     p.add_argument("--encoding", default="utf-8-sig",
         help="CSV file encoding (default: utf-8-sig — handles Excel BOM automatically)"
     )
+    p.add_argument(
+        "--checks", "-c",
+        nargs="+",
+        choices=["suffix", "class", "matrix", "empty", "all"],
+        default=["all"],
+        help=(
+            "Which checks to run (default: all). "
+            "'suffix' = name ↔ material; 'class' = class reflects material; "
+            "'matrix' = matrix Material field; 'empty' = missing composition. "
+            "Example: --checks suffix"
+        ),
+    )
     return p
+
+
+# Maps user-friendly check names → the underlying flag column.
+CHECK_NAME_TO_FLAG: dict[str, str] = {
+    "suffix": "flag_suffix_mismatch",
+    "class":  "flag_class_material_mismatch",
+    "matrix": "flag_material_field_mismatch",
+    "empty":  "flag_empty_material_composition",
+}
+
+
+def resolve_checks(names: list[str]) -> set[str]:
+    """Convert a list like ['suffix','class'] or ['all'] → set of flag column keys."""
+    if not names or "all" in names:
+        return set(ISSUE_FLAGS.keys())
+    return {CHECK_NAME_TO_FLAG[n] for n in names if n in CHECK_NAME_TO_FLAG}
 
 
 def load_csv(path: Path, encoding: str) -> pd.DataFrame:
@@ -669,7 +731,7 @@ def run_cli(args) -> None:
     print(f"Columns: {list(df_raw.columns)}\n")
 
     try:
-        df_result = analyze_dataframe(df_raw)
+        df_result = analyze_dataframe(df_raw, enabled_checks=resolve_checks(args.checks))
     except ValueError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
@@ -749,9 +811,49 @@ def run_gui() -> None:
     pick_btn = ttk.Button(file_frame, text="Choose CSV…", command=pick_file)
     pick_btn.pack(side="right", padx=(10, 0))
 
+    # ── Checks scope ───────────────────────────────────────────────────────
+    checks_frame = ttk.LabelFrame(main_frame, text="Checks to Run", padding=10)
+    checks_frame.pack(fill="x", pady=(12, 0))
+
+    check_vars: dict[str, tk.BooleanVar] = {
+        "suffix": tk.BooleanVar(value=True),
+        "class":  tk.BooleanVar(value=True),
+        "matrix": tk.BooleanVar(value=True),
+        "empty":  tk.BooleanVar(value=True),
+    }
+    check_labels = {
+        "suffix": "Name suffix ↔ material composition",
+        "class":  "Class reflects material composition",
+        "matrix": "Matrix Material field matches composition",
+        "empty":  "Missing material composition",
+    }
+
+    for key, label in check_labels.items():
+        ttk.Checkbutton(checks_frame, text=label, variable=check_vars[key]).pack(
+            anchor="w"
+        )
+
+    # Quick scope buttons
+    scope_btns = ttk.Frame(checks_frame)
+    scope_btns.pack(anchor="w", pady=(8, 0))
+
+    def set_scope(*keys):
+        for k, var in check_vars.items():
+            var.set(k in keys)
+
+    ttk.Button(scope_btns, text="All",
+               command=lambda: set_scope("suffix", "class", "matrix", "empty"),
+               width=10).pack(side="left")
+    ttk.Button(scope_btns, text="Suffix only",
+               command=lambda: set_scope("suffix"),
+               width=12).pack(side="left", padx=(6, 0))
+    ttk.Button(scope_btns, text="Class only",
+               command=lambda: set_scope("class"),
+               width=12).pack(side="left", padx=(6, 0))
+
     # Status / summary area
     status_frame = ttk.LabelFrame(main_frame, text="Status", padding=10)
-    status_frame.pack(fill="both", expand=True, pady=(16, 0))
+    status_frame.pack(fill="both", expand=True, pady=(12, 0))
 
     status_lbl = ttk.Label(
         status_frame,
@@ -821,14 +923,32 @@ def run_gui() -> None:
         status_lbl.config(text="Analyzing… please wait.", foreground="#000000")
         set_summary("")
 
+        # Snapshot the user's check selection at click time
+        selected = [k for k, v in check_vars.items() if v.get()]
+        if not selected:
+            messagebox.showwarning(
+                "No checks selected",
+                "Pick at least one check to run."
+            )
+            analyze_btn.config(state="normal")
+            pick_btn.config(state="normal")
+            return
+        enabled = resolve_checks(selected)
+
+        # Filename suffix reflecting scope: "all" or e.g. "suffix" or "suffix_class"
+        is_all = (set(selected) == set(check_vars.keys()))
+        scope_tag = "all" if is_all else "_".join(selected)
+
         def worker():
             try:
                 csv_p = Path(csv_path)
                 df_raw = load_csv(csv_p, "utf-8-sig")
-                df_result = analyze_dataframe(df_raw)
+                df_result = analyze_dataframe(df_raw, enabled_checks=enabled)
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                xlsx_p = csv_p.with_name(f"{csv_p.stem}_analysis_{timestamp}.xlsx")
+                xlsx_p = csv_p.with_name(
+                    f"{csv_p.stem}_analysis_{scope_tag}_{timestamp}.xlsx"
+                )
                 export_excel(df_result, str(xlsx_p))
 
                 total   = len(df_result)
