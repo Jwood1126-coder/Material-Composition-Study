@@ -372,9 +372,13 @@ def analyze_dataframe(
         "stainless steel", "steel", "brass", "aluminum", "aluminium", "aluminum alloy"
     ])
     if (~known_mat & (matc_lower != "")).any():
+        # NOTE: using `m != "" and (m in c)` (not `m and m in c`) because
+        # Python's `and` returns the first falsy operand — `"" and X` is `""`,
+        # producing a mixed str/bool Series and blowing up `&` later.
         substring_confirm = pd.Series(
-            [m and m in c for m, c in zip(matc_lower, klass_lower)],
+            [(m != "") and (m in c) for m, c in zip(matc_lower, klass_lower)],
             index=idx,
+            dtype=bool,
         )
         class_confirms = class_confirms | (substring_confirm & ~known_mat)
 
