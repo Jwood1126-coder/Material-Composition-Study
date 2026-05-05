@@ -97,18 +97,20 @@ EXEMPT_CLASS_SUBSTRINGS: list[str] = [
 ]
 
 # Issue flags — these contribute to any_flag and warrant human review.
+# Any row that produces an analysis note belongs here, so the count of
+# Has Issue == YES rows always matches the count of non-OK notes.
 ISSUE_FLAGS: dict[str, str] = {
     "flag_suffix_mismatch":            "Name Suffix ↔ Material Mismatch",
+    "flag_no_suffix_non_steel":        "No Material Suffix — Non-Steel Composition (Review)",
     "flag_class_material_mismatch":    "Class Doesn't Reflect Material",
     "flag_material_field_mismatch":    "Matrix Material Field Mismatch",
     "flag_empty_material_composition": "Missing Material Composition",
 }
 
-# Informational flags — noted for context but do NOT trigger any_flag.
+# Informational flags — context only, no analysis note, do NOT trigger any_flag.
 INFO_FLAGS: dict[str, str] = {
-    "flag_no_suffix_non_steel": "No Material Suffix — Non-Steel Composition (Review)",
-    "flag_is_matrix_parent":    "Matrix Parent (Multiple Compositions)",
-    "flag_is_bb_part":          "Brennan Black Part (Class Check Exempt)",
+    "flag_is_matrix_parent": "Matrix Parent (Multiple Compositions)",
+    "flag_is_bb_part":       "Brennan Black Part (Class Check Exempt)",
 }
 
 # Combined ordered dict used for display/export.
@@ -513,15 +515,22 @@ def analyze_dataframe(
             multi_mismatch = df[multi_eligible].apply(_multi_member, axis=1)
             flag_matrix.loc[multi_mismatch.index] |= multi_mismatch.fillna(False)
 
-    # ── INFO: no suffix → non-Steel composition (suppressed if suffix flag
-    # already fires, OR the class explicitly confirms the material) ─────
-    flag_no_suffix_non_steel = (
-        (expected_mat == "") & (matc_lower != "") & (matc_lower != "steel")
-        & ~flag_suffix & ~class_confirms
-    )
+    # ── ISSUE: no suffix → non-Steel composition (suppressed if suffix flag
+    # already fires, OR the class explicitly confirms the material).
+    # Treated as part of the suffix scope — gated by flag_suffix_mismatch in
+    # enabled_checks because the two checks are conceptually paired (one for
+    # rows WITH a contradicting suffix, one for rows WITHOUT a needed one).
+    if "flag_suffix_mismatch" in enabled_checks:
+        flag_no_suffix_non_steel = (
+            (expected_mat == "") & (matc_lower != "") & (matc_lower != "steel")
+            & ~flag_suffix & ~class_confirms
+        )
+    else:
+        flag_no_suffix_non_steel = pd.Series([False] * n, index=idx)
 
-    # any_flag = OR of issue flags only
-    any_flag = flag_suffix | flag_class | flag_matrix | flag_empty
+    # any_flag = OR of all issue flags. Must include flag_no_suffix_non_steel
+    # so the count of "Has Issue == YES" matches the count of non-OK notes.
+    any_flag = flag_suffix | flag_no_suffix_non_steel | flag_class | flag_matrix | flag_empty
 
     report(0.85, "Composing analysis notes…")
 
