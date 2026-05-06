@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 try:
     import xlsxwriter
@@ -102,6 +102,7 @@ EXEMPT_CLASS_SUBSTRINGS: list[str] = [
 # Any row that produces an analysis note belongs here, so the count of
 # Has Issue == YES rows always matches the count of non-OK notes.
 ISSUE_FLAGS: dict[str, str] = {
+    "flag_legacy_disagrees":           "Legacy ERP Disagrees with Material Composition",
     "flag_suffix_mismatch":            "Name Suffix ↔ Material Mismatch",
     "flag_no_suffix_non_steel":        "No Material Suffix — Non-Steel Composition (Review)",
     "flag_class_material_mismatch":    "Class Doesn't Reflect Material",
@@ -236,10 +237,96 @@ def _resolve_column(col_map: dict[str, str], *candidates: str) -> str | None:
     return None
 
 
+# ── Legacy ERP Cross-Check ─────────────────────────────────────────────────────
+
+# Sentinel placeholder text treated as missing in legacy CSVs (same set as the
+# main sanitizer below — kept aligned so behavior is consistent).
+_LEGACY_SENTINELS = {
+    "nan", "NaN", "None", "none",
+    "tbd", "TBD", "n/a", "N/A", "na", "NA",
+    "unknown", "Unknown", "UNKNOWN",
+    "?", "—", "-",
+}
+
+
+def build_legacy_lookup(legacy_df: pd.DataFrame) -> dict[str, str]:
+    """
+    Build a part-number → material lookup from a legacy ERP CSV.
+
+    Required columns (matched case-insensitively, with common aliases):
+      - Part Number  (or 'Part #', 'PartNum', 'Item Number', 'Item #')
+      - Material     (or 'Material Composition')
+
+    Returns a dict mapping lowercased part numbers → cleaned material strings.
+    Blank part numbers, blank materials, and sentinel placeholders are skipped.
+    On duplicate keys with conflicting materials, the FIRST occurrence wins
+    (legacy data is treated as immutable; later rows are presumed to be
+    corrections OR clerical re-entries — we don't know which, so the safer
+    default is to surface conflicts as duplicates rather than silently
+    overwrite).
+
+    Sanity checks:
+      - Both required columns must be present (otherwise raises ValueError)
+      - Trailing/leading whitespace stripped from both columns
+      - Sentinel placeholders ("TBD", "N/A", etc.) treated as blank
+      - At least one valid (part, material) pair required
+    """
+    if legacy_df is None or len(legacy_df) == 0:
+        return {}
+
+    cols = {c.strip().lower(): c for c in legacy_df.columns}
+    pn_col = next(
+        (cols[k] for k in ("part number", "part #", "partnum", "part_number",
+                           "item number", "item #", "item")
+         if k in cols),
+        None
+    )
+    mat_col = next(
+        (cols[k] for k in ("material", "material composition",
+                           "material_composition", "materialcomposition")
+         if k in cols),
+        None
+    )
+    if not pn_col or not mat_col:
+        raise ValueError(
+            f"Legacy ERP CSV must have a Part Number column and a Material column. "
+            f"Found columns: {list(legacy_df.columns)}"
+        )
+
+    pn = (legacy_df[pn_col].fillna("").astype(str).str.strip())
+    mat = (legacy_df[mat_col].fillna("").astype(str).str.strip())
+
+    lookup: dict[str, str] = {}
+    skipped_blank = 0
+    conflicts = 0
+    for raw_p, raw_m in zip(pn, mat):
+        if raw_p in _LEGACY_SENTINELS or raw_m in _LEGACY_SENTINELS:
+            skipped_blank += 1
+            continue
+        if not raw_p or not raw_m:
+            skipped_blank += 1
+            continue
+        key = raw_p.lower()
+        if key in lookup:
+            if lookup[key].lower() != raw_m.lower():
+                conflicts += 1
+            # First-occurrence wins — don't overwrite
+            continue
+        lookup[key] = raw_m
+
+    if not lookup:
+        raise ValueError(
+            "Legacy ERP CSV produced 0 usable (Part Number, Material) pairs — "
+            "every row was blank or a placeholder."
+        )
+    return lookup
+
+
 def analyze_dataframe(
     df: pd.DataFrame,
     enabled_checks: set[str] | None = None,
     progress_callback=None,
+    legacy_lookup: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """
     Vectorized analysis pipeline. ~10–50× faster than per-row iteration on
@@ -249,6 +336,11 @@ def analyze_dataframe(
                        Disabled checks remain as columns but stay False.
     progress_callback: optional callable(pct: float, message: str) called at
                        phase boundaries (pct in [0.0, 1.0]).
+    legacy_lookup    : optional dict mapping lowercased part-number → material
+                       (built via build_legacy_lookup from a legacy ERP CSV).
+                       When provided, each row is matched against External ID
+                       first, then Name. Matches act as authoritative
+                       confirmation; mismatches fire flag_legacy_disagrees.
     """
     if enabled_checks is None:
         enabled_checks = set(ISSUE_FLAGS.keys())
@@ -270,6 +362,10 @@ def analyze_dataframe(
 
     col_id       = _resolve_column(col_map, "internal id", "internalid", "internal_id", "id")
     col_name     = _resolve_column(col_map, "name", "item name", "item_name")
+    col_ext_id   = _resolve_column(
+        col_map, "external id", "externalid", "external_id", "ext id",
+        "external", "name (external id)"
+    )
     col_class    = _resolve_column(col_map, "class", "item class", "item_class")
     col_material = _resolve_column(col_map, "material")
     col_mat_comp = _resolve_column(
@@ -302,7 +398,7 @@ def analyze_dataframe(
         "unknown": "", "Unknown": "", "UNKNOWN": "",
         "?": "", "—": "", "-": "",
     }
-    for col in filter(None, [col_id, col_name, col_class, col_material, col_mat_comp]):
+    for col in filter(None, [col_id, col_name, col_ext_id, col_class, col_material, col_mat_comp]):
         df[col] = (
             df[col]
             .fillna("")
@@ -316,10 +412,25 @@ def analyze_dataframe(
     matc      = df[col_mat_comp]  if col_mat_comp else pd.Series([""] * n, index=idx)
     material  = df[col_material]  if col_material else pd.Series([""] * n, index=idx)
     int_id    = df[col_id]        if col_id       else pd.Series([""] * n, index=idx)
+    ext_id    = df[col_ext_id]    if col_ext_id   else pd.Series([""] * n, index=idx)
 
     klass_lower = klass.str.lower()
     matc_lower  = matc.str.lower()
     mat_lower   = material.str.lower()
+
+    # ── Legacy ERP lookup ──────────────────────────────────────────────────
+    # Match each row by External ID first, then by Name. legacy_material is
+    # the cleaned legacy ERP material string (or "" when no match).
+    if legacy_lookup:
+        ext_lower  = ext_id.str.lower()
+        name_lower_for_lookup = name.str.lower()
+        legacy_via_ext  = ext_lower.map(legacy_lookup).fillna("")
+        legacy_via_name = name_lower_for_lookup.map(legacy_lookup).fillna("")
+        legacy_mat = legacy_via_ext.where(legacy_via_ext != "", legacy_via_name)
+    else:
+        legacy_mat = pd.Series([""] * n, index=idx, dtype=object)
+    legacy_lower = legacy_mat.str.lower()
+    has_legacy   = legacy_lower != ""
 
     report(0.10, "Parsing names…")
 
@@ -341,10 +452,8 @@ def analyze_dataframe(
     expected_mat = expected_mat.mask(~has_ss & has_b_suffix, "Brass")
     expected_mat = expected_mat.mask(~has_ss & ~has_b_suffix & has_d, "Aluminum")
 
-    # Initial recommendation — refined below once class_confirms is known.
-    # (suffix-derived material if any, else default to "Steel"; see refinement
-    # after class_confirms is computed)
-    recommended_mat = expected_mat.where(expected_mat != "", "Steel")
+    # `recommended_mat` is finalized after class_confirms / legacy / forward
+    # mismatch are all known — placeholder; real value is set below.
 
     # ── Multi-composition + matrix parent detection ────────────────────────
     has_multi_comp = matc.str.contains(r"[,;|\n]", regex=True, na=False)
@@ -364,6 +473,7 @@ def analyze_dataframe(
     # ── Class & name keyword extraction (used by class check and class_confirms) ─
     name_lower = name.str.lower()
 
+    # Class signals
     contains_stainless = klass_lower.str.contains("stainless", na=False)
     contains_steel     = klass_lower.str.contains("steel",     na=False)
     contains_brass     = klass_lower.str.contains("brass",     na=False)
@@ -371,21 +481,41 @@ def analyze_dataframe(
     contains_alum      = klass_lower.str.contains(
         r"alumin(?:um|ium)|aerospace", regex=True, na=False
     )
-    # "ALUM" anywhere in the part name (e.g. ALUM VENT 3 FPT) also confirms Aluminum
+
+    # Name signals — patterns picked to match the user's actual NetSuite
+    # naming conventions seen in production exports:
+    #   ALUM VENT, BRS, BR$, 30B (digit+B at end), 316/304 alloy codes,
+    #   S/S, standalone S, etc.
     name_says_alum = name_lower.str.contains(r"\balum", regex=True, na=False)
+    name_says_brass = name_lower.str.contains(
+        r"\bbrass\b|\bbrs\b|\bbr\b|br$|\d[bB]$",
+        regex=True, na=False
+    )
+    name_says_stainless = name_lower.str.contains(
+        r"\bss\b|\bs/s\b|\b316l?\b|\b304l?\b|\bstainless\b"
+        r"|(?:^|[^a-z0-9])s(?:[^a-z0-9]|$)",
+        regex=True, na=False
+    )
+    name_says_steel = name_lower.str.contains(r"\bsteel\b", regex=True, na=False)
 
     # Class (or name) confirms the material composition?
-    # Used to suppress the *reverse* suffix and "no-suffix non-Steel" flags
-    # — if the class or name explicitly names the material, the composition
-    # is taken to be correct and a missing/odd suffix doesn't warrant a
-    # rename suggestion.
+    # Used to suppress *both* the reverse suffix flags AND the forward suffix
+    # mismatch — if class/name explicitly name the actual composition, the
+    # name's suffix is the misleading element, not the composition.
     is_alum_comp = matc_lower.isin(["aluminum", "aluminium", "aluminum alloy"])
     class_confirms = (
-          ((matc_lower == "stainless steel") & contains_stainless)
-        | ((matc_lower == "steel") & contains_steel & ~contains_stainless)
-        | ((matc_lower == "brass") & contains_brass)
+          ((matc_lower == "stainless steel") & (contains_stainless | name_says_stainless))
+        | ((matc_lower == "steel") & (contains_steel | name_says_steel)
+           & ~contains_stainless & ~name_says_stainless)
+        | ((matc_lower == "brass") & (contains_brass | name_says_brass))
         | (is_alum_comp & (contains_alum | name_says_alum))
     )
+
+    # Legacy ERP confirmation: the strongest possible signal.
+    # Matches when the legacy material exactly matches the current composition
+    # (case-insensitive). When this fires, all soft suffix flags are suppressed.
+    legacy_confirms = has_legacy & (legacy_lower == matc_lower)
+    class_confirms  = class_confirms | legacy_confirms
     # Generic substring fallback: any non-empty composition whose lowercased
     # form appears verbatim in the class name (e.g. "Nylon" in "...P.T.C - Nylon").
     # Only relevant for materials not in the known list above.
@@ -403,14 +533,6 @@ def analyze_dataframe(
         )
         class_confirms = class_confirms | (substring_confirm & ~known_mat)
 
-    # ── Refine recommended_material now that class_confirms is known ───────
-    # If the class explicitly confirms the composition, recommend keeping the
-    # current Material Composition (not the suffix-derived material, and not
-    # the default Steel). This stops the report from saying "Recommended:
-    # Steel" on rows that are already correct (e.g., a Nylon part with
-    # "Industrial Fittings - Nylon" class).
-    recommended_mat = recommended_mat.where(~class_confirms, matc)
-
     report(0.30, "Checking suffix rules…")
 
     # ── FLAG: empty material composition ───────────────────────────────────
@@ -419,15 +541,26 @@ def analyze_dataframe(
     else:
         flag_empty = pd.Series([False] * n, index=idx)
 
+    # ── FLAG: legacy ERP disagrees with Material Composition ──────────────
+    # This is the highest-confidence flag — when the legacy ERP says one
+    # material and NetSuite has another, NetSuite is almost certainly wrong.
+    if "flag_legacy_disagrees" in enabled_checks:
+        flag_legacy_disagrees = (
+            has_legacy & (matc_lower != "") & (legacy_lower != matc_lower)
+        )
+    else:
+        flag_legacy_disagrees = pd.Series([False] * n, index=idx)
+
     # ── FLAG: suffix mismatch (bidirectional) ──────────────────────────────
-    # Forward mismatch (suffix actively contradicts the composition) is ALWAYS
-    # flagged. Reverse mismatch (composition needs a suffix the name lacks) is
-    # SUPPRESSED when the class confirms the material — the data is consistent
-    # with the rest of the record so the part name is the odd one out, but it
-    # may be intentional and shouldn't trigger an alarm.
+    # Forward mismatch (suffix actively contradicts the composition) is now
+    # SUPPRESSED when class/name/legacy confirms the actual composition —
+    # in that case the suffix is the misleading element, not the composition.
+    # Reverse mismatch (composition needs a suffix the name lacks) is
+    # likewise suppressed when class confirms.
     expected_lower  = expected_mat.str.lower()
     forward_mismatch = (
         (expected_mat != "") & (matc_lower != "") & (expected_lower != matc_lower)
+        & ~class_confirms
     )
     is_single = ~has_multi_comp & ~is_matrix_parent
 
@@ -560,7 +693,21 @@ def analyze_dataframe(
 
     # any_flag = OR of all issue flags. Must include flag_no_suffix_non_steel
     # so the count of "Has Issue == YES" matches the count of non-OK notes.
-    any_flag = flag_suffix | flag_no_suffix_non_steel | flag_class | flag_matrix | flag_empty
+    any_flag = (
+        flag_legacy_disagrees | flag_suffix | flag_no_suffix_non_steel
+        | flag_class | flag_matrix | flag_empty
+    )
+
+    # ── Recommended Material (final) ────────────────────────────────────────
+    # Priority (most → least authoritative):
+    #   1. Legacy ERP material (when present) — authoritative source
+    #   2. Suffix-derived material when forward mismatch fires AND no other
+    #      signal confirms — the suffix is positive evidence
+    #   3. Current Material Composition — trust what's already there
+    #   4. "Steel" — only when composition is genuinely empty
+    recommended_mat = matc.where(matc != "", "Steel")
+    recommended_mat = recommended_mat.mask(forward_mismatch, expected_mat)
+    recommended_mat = recommended_mat.mask(has_legacy, legacy_mat)
 
     report(0.85, "Composing analysis notes…")
 
@@ -570,6 +717,14 @@ def analyze_dataframe(
 
     if "flag_empty_material_composition" in enabled_checks:
         parts = parts.mask(flag_empty, parts + SEP + "Material Composition is blank")
+
+    # Legacy ERP disagreement note — high-priority, high-confidence
+    if "flag_legacy_disagrees" in enabled_checks:
+        legacy_disagree_text = (
+            "Legacy ERP says '" + legacy_mat
+            + "' but Material Composition is '" + matc + "'"
+        )
+        parts = parts.mask(flag_legacy_disagrees, parts + SEP + legacy_disagree_text)
 
     if "flag_suffix_mismatch" in enabled_checks:
         # Forward
@@ -625,13 +780,25 @@ def analyze_dataframe(
     notes = notes.where(notes != "", "OK")
 
     # ── Suggested Fix column ───────────────────────────────────────────────
-    # Templated, actionable text per row. When multiple fixes apply we pick
-    # the most specific one (forward suffix > class > matrix > empty > soft).
+    # Templated, actionable text per row. Picked in priority order — legacy
+    # ERP first (most authoritative), then suffix, class, matrix, empty, soft.
     fix = pd.Series([""] * n, index=idx, dtype=object)
+
+    # Legacy ERP disagrees — strongest signal, recommend the legacy value
+    fix = fix.mask(
+        flag_legacy_disagrees,
+        "Legacy ERP says '" + legacy_mat
+        + "' — verify and update Material Composition to match (or correct legacy if NetSuite is right)"
+    )
+    # Composition empty but legacy has a value — populate from legacy
+    fix = fix.mask(
+        flag_empty & has_legacy & (fix == ""),
+        "Set Material Composition to legacy ERP value: '" + legacy_mat + "'"
+    )
 
     # Forward suffix: composition is real, name is wrong → rename to add suffix
     fix = fix.mask(
-        forward_mismatch,
+        forward_mismatch & (fix == ""),
         "Either rename the part to match '" + matc + "' "
         "OR change Material Composition to '" + expected_mat + "'"
     )
@@ -677,6 +844,7 @@ def analyze_dataframe(
 
     # ── Assemble result ────────────────────────────────────────────────────
     result = df.copy()
+    result["flag_legacy_disagrees"]           = flag_legacy_disagrees.astype(bool)
     result["flag_suffix_mismatch"]            = flag_suffix.astype(bool)
     result["flag_class_material_mismatch"]    = flag_class.astype(bool)
     result["flag_material_field_mismatch"]    = flag_matrix.astype(bool)
@@ -684,6 +852,7 @@ def analyze_dataframe(
     result["flag_no_suffix_non_steel"]        = flag_no_suffix_non_steel.astype(bool)
     result["flag_is_matrix_parent"]           = is_matrix_parent.astype(bool)
     result["flag_is_bb_part"]                 = is_bb_flag.astype(bool)
+    result["legacy_material"]                 = legacy_mat
     result["recommended_material"]            = recommended_mat
     result["expected_material_from_name"]     = expected_mat
     result["analysis_notes"]                  = notes
@@ -744,6 +913,7 @@ _C = {
 }
 
 _FRIENDLY_NAMES: dict[str, str] = {
+    "flag_legacy_disagrees":           "Legacy ERP Mismatch",
     "flag_suffix_mismatch":            "Suffix Mismatch",
     "flag_no_suffix_non_steel":        "No-Suffix Non-Steel (Review)",
     "flag_class_material_mismatch":    "Class Mismatch",
@@ -752,6 +922,7 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "flag_is_matrix_parent":           "Matrix Parent",
     "flag_is_bb_part":                 "BB Part (Exempt)",
     "any_flag":                        "Has Issue",
+    "legacy_material":                 "Legacy ERP Material",
     "recommended_material":            "Recommended Material",
     "expected_material_from_name":     "Suffix-Detected Material",
     "analysis_notes":                  "Analysis Notes",
@@ -786,8 +957,9 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
                 pass
 
     # ── Column ordering ────────────────────────────────────────────────────
-    derived_cols   = ["recommended_material", "expected_material_from_name",
-                      "suggested_fix", "analysis_notes"]
+    derived_cols   = ["legacy_material", "recommended_material",
+                      "expected_material_from_name", "suggested_fix",
+                      "analysis_notes"]
     source_cols = [
         c for c in df.columns
         if c not in FLAG_COLS + ["any_flag"] + derived_cols
@@ -908,6 +1080,16 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
         ("Records with Issues",     f"{flagged:,}"),
         ("Clean Records",           f"{total - flagged:,}"),
         ("Issue Rate",              f"{flagged / total * 100:.1f}%" if total else "—"),
+    ]
+    # Surface legacy match coverage when a legacy ERP cross-check was applied
+    if "legacy_material" in df.columns:
+        legacy_matches = int((df["legacy_material"] != "").sum())
+        if legacy_matches > 0:
+            cov = legacy_matches / total * 100 if total else 0.0
+            summary_rows.append(
+                ("Legacy ERP Matches", f"{legacy_matches:,}  ({cov:.1f}%)")
+            )
+    summary_rows += [
         ("", ""),
         ("Issue Breakdown (a single row may be counted in multiple lines)", "Count"),
     ]
@@ -918,7 +1100,7 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
     # Start writing at row 3 (0-indexed), leaving row 2 as a spacer
     out_row = 3
     bold_keys = {"Total Records Analyzed", "Records with Issues",
-                 "Clean Records", "Issue Rate"}
+                 "Clean Records", "Issue Rate", "Legacy ERP Matches"}
     for label, value in summary_rows:
         if label.startswith("Issue Breakdown"):
             ws.write(out_row, 0, label, fmt["section"])
@@ -964,7 +1146,7 @@ def _write_data_sheet_xlsx(ws, df: pd.DataFrame, fmt: dict, on_chunk_written) ->
             ws.set_column(col_idx, col_idx, 60, fmt["notes"])
         elif col_idx in flag_positions:
             ws.set_column(col_idx, col_idx, 16, fmt["center"])
-        elif c in ("recommended_material", "expected_material_from_name"):
+        elif c in ("recommended_material", "expected_material_from_name", "legacy_material"):
             ws.set_column(col_idx, col_idx, 26)
         else:
             if n_rows > 0:
@@ -1047,14 +1229,23 @@ Examples:
     p.add_argument(
         "--checks", "-c",
         nargs="+",
-        choices=["suffix", "class", "matrix", "empty", "all"],
+        choices=["suffix", "class", "matrix", "empty", "legacy", "all"],
         default=["all"],
         help=(
             "Which checks to run (default: all). "
             "'suffix' = name ↔ material; 'class' = class reflects material; "
-            "'matrix' = matrix Material field; 'empty' = missing composition. "
-            "Example: --checks suffix"
+            "'matrix' = matrix Material field; 'empty' = missing composition; "
+            "'legacy' = legacy ERP cross-check (requires --legacy-csv). "
+            "Example: --checks suffix legacy"
         ),
+    )
+    p.add_argument(
+        "--legacy-csv",
+        metavar="LEGACY.csv",
+        help="Optional legacy ERP CSV with Part Number + Material columns. "
+             "When provided, each NetSuite row is matched against External ID "
+             "(falling back to Name) and the legacy material is used as an "
+             "authoritative cross-check.",
     )
     return p
 
@@ -1065,6 +1256,7 @@ CHECK_NAME_TO_FLAG: dict[str, str] = {
     "class":  "flag_class_material_mismatch",
     "matrix": "flag_material_field_mismatch",
     "empty":  "flag_empty_material_composition",
+    "legacy": "flag_legacy_disagrees",
 }
 
 
@@ -1097,8 +1289,26 @@ def run_cli(args) -> None:
     df_raw = load_csv(csv_path, args.encoding)
     print(f"Columns: {list(df_raw.columns)}\n")
 
+    legacy_lookup = None
+    if args.legacy_csv:
+        legacy_path = Path(args.legacy_csv)
+        if not legacy_path.exists():
+            print(f"ERROR: Legacy ERP CSV not found: {legacy_path}")
+            sys.exit(1)
+        legacy_df = load_csv(legacy_path, args.encoding)
+        try:
+            legacy_lookup = build_legacy_lookup(legacy_df)
+            print(f"Loaded {len(legacy_lookup):,} legacy ERP entries\n")
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+
     try:
-        df_result = analyze_dataframe(df_raw, enabled_checks=resolve_checks(args.checks))
+        df_result = analyze_dataframe(
+            df_raw,
+            enabled_checks=resolve_checks(args.checks),
+            legacy_lookup=legacy_lookup,
+        )
     except ValueError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
@@ -1134,10 +1344,10 @@ def run_gui() -> None:
 
     root = tk.Tk()
     root.title("Material Composition Analyzer")
-    root.geometry("660x680")
-    root.minsize(600, 620)
+    root.geometry("680x760")
+    root.minsize(620, 700)
 
-    state = {"csv_path": None, "xlsx_path": None}
+    state = {"csv_path": None, "xlsx_path": None, "legacy_path": None}
 
     # ── Layout ─────────────────────────────────────────────────────────────
     main_frame = ttk.Frame(root, padding=20)
@@ -1177,6 +1387,37 @@ def run_gui() -> None:
 
     pick_btn = ttk.Button(file_frame, text="Choose CSV…", command=pick_file)
     pick_btn.pack(side="right", padx=(10, 0))
+
+    # ── Optional legacy ERP cross-check ─────────────────────────────────────
+    legacy_frame = ttk.LabelFrame(
+        main_frame, text="Legacy ERP Cross-Check (optional)", padding=10
+    )
+    legacy_frame.pack(fill="x", pady=(8, 0))
+
+    legacy_lbl = ttk.Label(
+        legacy_frame, text="(no file selected)", foreground="#888888"
+    )
+    legacy_lbl.pack(side="left", fill="x", expand=True)
+
+    def clear_legacy():
+        state["legacy_path"] = None
+        legacy_lbl.config(text="(no file selected)", foreground="#888888")
+
+    def pick_legacy():
+        path = filedialog.askopenfilename(
+            title="Select Legacy ERP CSV (Part Number + Material columns)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            state["legacy_path"] = path
+            legacy_lbl.config(text=Path(path).name, foreground="#000000")
+
+    legacy_clear_btn = ttk.Button(legacy_frame, text="Clear", command=clear_legacy)
+    legacy_clear_btn.pack(side="right", padx=(6, 0))
+    legacy_pick_btn = ttk.Button(
+        legacy_frame, text="Choose Legacy CSV…", command=pick_legacy
+    )
+    legacy_pick_btn.pack(side="right", padx=(10, 0))
 
     # ── Checks scope ───────────────────────────────────────────────────────
     checks_frame = ttk.LabelFrame(main_frame, text="Checks to Run", padding=10)
@@ -1337,18 +1578,37 @@ def run_gui() -> None:
                 push_progress(start + span * local_pct, msg)
             return cb
 
+        # Snapshot legacy path at click time too
+        legacy_path = state.get("legacy_path")
+
         def worker():
             try:
                 csv_p = Path(csv_path)
                 push_progress(0.01, "Reading CSV…")
                 df_raw = load_csv(csv_p, "utf-8-sig")
-                push_progress(0.05, f"Loaded {len(df_raw):,} rows")
+                push_progress(0.04, f"Loaded {len(df_raw):,} rows")
+
+                # Load legacy ERP lookup if a path was picked
+                legacy_lookup = None
+                legacy_match_count = 0
+                if legacy_path:
+                    push_progress(0.05, "Reading legacy ERP CSV…")
+                    legacy_df = load_csv(Path(legacy_path), "utf-8-sig")
+                    legacy_lookup = build_legacy_lookup(legacy_df)
+                    push_progress(
+                        0.06,
+                        f"Legacy ERP: {len(legacy_lookup):,} entries loaded"
+                    )
 
                 df_result = analyze_dataframe(
                     df_raw,
                     enabled_checks=enabled,
-                    progress_callback=make_phase_cb(0.05, 0.35),
+                    progress_callback=make_phase_cb(0.06, 0.35),
+                    legacy_lookup=legacy_lookup,
                 )
+
+                if legacy_lookup is not None:
+                    legacy_match_count = int((df_result["legacy_material"] != "").sum())
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 xlsx_p = csv_p.with_name(
@@ -1368,9 +1628,14 @@ def run_gui() -> None:
                     f"Analyzed:       {total:,} records",
                     f"With issues:    {flagged:,}  ({pct:.1f}%)",
                     f"Clean:          {total - flagged:,}",
-                    "",
-                    "Issue breakdown:",
                 ]
+                if legacy_lookup is not None:
+                    pct_match = legacy_match_count / total * 100 if total else 0.0
+                    lines.append(
+                        f"Legacy match:   {legacy_match_count:,} of {total:,} "
+                        f"({pct_match:.1f}%)"
+                    )
+                lines += ["", "Issue breakdown:"]
                 for col, label in FLAG_META.items():
                     if col in df_result.columns:
                         cnt = int(df_result[col].sum())
