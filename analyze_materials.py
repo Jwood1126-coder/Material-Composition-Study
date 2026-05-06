@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 try:
     import xlsxwriter
@@ -99,21 +99,21 @@ EXEMPT_CLASS_SUBSTRINGS: list[str] = [
 ]
 
 # Issue flags — these contribute to any_flag and warrant human review.
-# Every flag here represents POSITIVE evidence that something is wrong:
-#   - legacy_disagrees: legacy ERP says X, NetSuite says Y
-#   - suffix_mismatch:  name suffix actively contradicts composition
-#   - class_material:   class actively doesn't reflect composition
-#   - matrix_field:     matrix Material field disagrees with composition
-#   - empty:            composition is missing entirely
+# Every flag here represents POSITIVE evidence that something is wrong.
+# Evidence is ranked by reliability per the user's directive:
+#   1. Suffix / name pattern  — most authoritative
+#   2. Legacy ERP material    — second
+#   3. Class string           — third (often wrong)
+# Higher-priority confirmation suppresses lower-priority disagreement
+# flags, and the recommendation column always reflects the highest-
+# priority signal in play.
 # We deliberately do NOT flag *absence of evidence* (e.g. Brass material
-# with no -B suffix and no contradicting class). Many parts use legitimate
-# alternate naming conventions where -B is not used — flagging those would
-# be noise, not signal.
+# with no -B suffix and a generic class). Many parts use legitimate
+# alternate naming conventions; flagging those would be noise.
 ISSUE_FLAGS: dict[str, str] = {
-    "flag_legacy_disagrees":           "Legacy ERP Disagrees with Material Composition",
     "flag_suffix_mismatch":            "Name Suffix ↔ Material Mismatch",
-    "flag_class_material_mismatch":    "Class Doesn't Reflect Material",
-    "flag_material_field_mismatch":    "Matrix Material Field Mismatch",
+    "flag_legacy_disagrees":           "Legacy ERP Disagrees with Material Composition",
+    "flag_class_material_mismatch":    "Class Names Different Material",
     "flag_empty_material_composition": "Missing Material Composition",
 }
 
@@ -453,7 +453,11 @@ def analyze_dataframe(
     last_seg      = segments.map(lambda s: s[-1] if s else "")
     has_b_suffix  = (last_seg == "B")    # exact -B (not -BB)
 
-    # Expected material from suffix (priority: SS > B > D)
+    # Expected material from NAME (suffix first, then broader name patterns).
+    # The full hierarchy: SS-segment > -B last seg > D-segment > name patterns.
+    # Name patterns fill in when no suffix is present, so e.g. "200-24BR"
+    # (Brass per "BR" pattern) flows through the same forward-mismatch rule
+    # as a literal -B suffix.
     expected_mat = pd.Series([""] * n, index=idx, dtype=object)
     expected_mat = expected_mat.mask(has_ss, "Stainless Steel")
     expected_mat = expected_mat.mask(~has_ss & has_b_suffix, "Brass")
@@ -505,47 +509,39 @@ def analyze_dataframe(
     )
     name_says_steel = name_lower.str.contains(r"\bsteel\b", regex=True, na=False)
 
-    # Class (or name) confirms the material composition?
-    # Used to suppress *both* the reverse suffix flags AND the forward suffix
-    # mismatch — if class/name explicitly name the actual composition, the
-    # name's suffix is the misleading element, not the composition.
-    is_alum_comp = matc_lower.isin(["aluminum", "aluminium", "aluminum alloy"])
-    # Class and name are evaluated as INDEPENDENT signals — either one alone
-    # can confirm the composition. For plain "Steel" we require the
-    # confirming signal to NOT also say "stainless" (so a stainless class
-    # doesn't accidentally confirm plain steel), but the *other* channel's
-    # contradictions don't disqualify confirmation.
-    class_confirms = (
-          ((matc_lower == "stainless steel") & (contains_stainless | name_says_stainless))
-        | ((matc_lower == "steel") & (
-              (contains_steel & ~contains_stainless)
-            | (name_says_steel & ~name_says_stainless)
-          ))
-        | ((matc_lower == "brass") & (contains_brass | name_says_brass))
-        | (is_alum_comp & (contains_alum | name_says_alum))
+    # Fall-through: when no suffix-derived material was set, use the name
+    # patterns. Order matters when multiple patterns match — we apply most
+    # specific first (Stainless > Aluminum > Brass > Steel).
+    expected_mat = expected_mat.mask(
+        (expected_mat == "") & name_says_stainless, "Stainless Steel"
+    )
+    expected_mat = expected_mat.mask(
+        (expected_mat == "") & name_says_alum, "Aluminum"
+    )
+    expected_mat = expected_mat.mask(
+        (expected_mat == "") & name_says_brass, "Brass"
+    )
+    expected_mat = expected_mat.mask(
+        (expected_mat == "") & name_says_steel, "Steel"
     )
 
-    # Legacy ERP confirmation: the strongest possible signal.
-    # Matches when the legacy material exactly matches the current composition
-    # (case-insensitive). When this fires, all soft suffix flags are suppressed.
-    legacy_confirms = has_legacy & (legacy_lower == matc_lower)
-    class_confirms  = class_confirms | legacy_confirms
-    # Generic substring fallback: any non-empty composition whose lowercased
-    # form appears verbatim in the class name (e.g. "Nylon" in "...P.T.C - Nylon").
-    # Only relevant for materials not in the known list above.
-    known_mat = matc_lower.isin([
-        "stainless steel", "steel", "brass", "aluminum", "aluminium", "aluminum alloy"
-    ])
-    if (~known_mat & (matc_lower != "")).any():
-        # NOTE: using `m != "" and (m in c)` (not `m and m in c`) because
-        # Python's `and` returns the first falsy operand — `"" and X` is `""`,
-        # producing a mixed str/bool Series and blowing up `&` later.
-        substring_confirm = pd.Series(
-            [(m != "") and (m in c) for m, c in zip(matc_lower, klass_lower)],
-            index=idx,
-            dtype=bool,
-        )
-        class_confirms = class_confirms | (substring_confirm & ~known_mat)
+    is_alum_comp = matc_lower.isin(["aluminum", "aluminium", "aluminum alloy"])
+
+    # ── Priority-based confirmation signals ────────────────────────────────
+    # Evidence ranking per the user's directive (most → least authoritative):
+    #   1. Suffix / name pattern (-SS, -B, -D, "ALUM", "316", "BR", etc.)
+    #   2. Legacy ERP material lookup
+    #   3. Class string (often wrong, partial evidence only)
+    #
+    # Each tier confirms the composition independently — and a higher-tier
+    # confirmation suppresses lower-tier disagreement flags. Class never
+    # suppresses a suffix or legacy mismatch — class is the least reliable
+    # source and can't override the others.
+    expected_lower      = expected_mat.str.lower()
+    name_confirms_comp  = (
+        (expected_mat != "") & (matc_lower != "") & (expected_lower == matc_lower)
+    )
+    legacy_confirms_comp = has_legacy & (legacy_lower == matc_lower)
 
     report(0.30, "Checking suffix rules…")
 
@@ -555,36 +551,32 @@ def analyze_dataframe(
     else:
         flag_empty = pd.Series([False] * n, index=idx)
 
-    # ── FLAG: legacy ERP disagrees with Material Composition ──────────────
-    # This is the highest-confidence flag — when the legacy ERP says one
-    # material and NetSuite has another, NetSuite is almost certainly wrong.
-    if "flag_legacy_disagrees" in enabled_checks:
-        flag_legacy_disagrees = (
-            has_legacy & (matc_lower != "") & (legacy_lower != matc_lower)
-        )
-    else:
-        flag_legacy_disagrees = pd.Series([False] * n, index=idx)
-
-    # ── FLAG: suffix mismatch (forward only) ────────────────────────────────
-    # Only fires when the name's suffix ACTIVELY contradicts the composition
-    # (e.g. -SS on a Steel part). Suppressed when class/name/legacy confirms
-    # the composition (in that case the suffix is the misleading element).
-    #
-    # We deliberately do NOT flag the reverse case (Brass composition without
-    # -B, etc.) — many parts legitimately use alternate naming conventions
-    # without the material suffix, and flagging absence-of-evidence creates
-    # noise without an actionable recommendation.
-    expected_lower  = expected_mat.str.lower()
+    # ── FLAG: suffix / name mismatch (highest priority) ─────────────────────
+    # Fires whenever the name (suffix or pattern) implies a different
+    # material than the current composition. The name is the most
+    # authoritative signal — a class confirmation does NOT suppress this,
+    # because class is the least reliable evidence source and shouldn't
+    # override the name.
     forward_mismatch = (
         (expected_mat != "") & (matc_lower != "") & (expected_lower != matc_lower)
-        & ~class_confirms
     )
-
     if "flag_suffix_mismatch" in enabled_checks:
         flag_suffix = forward_mismatch
     else:
         flag_suffix = pd.Series([False] * n, index=idx)
         forward_mismatch = pd.Series([False] * n, index=idx)
+
+    # ── FLAG: legacy ERP disagrees (second-priority) ───────────────────────
+    # Fires when the legacy lookup disagrees with the current composition,
+    # UNLESS the name (higher priority) confirms the composition. In that
+    # case the legacy entry is most likely the wrong one.
+    if "flag_legacy_disagrees" in enabled_checks:
+        flag_legacy_disagrees = (
+            has_legacy & (matc_lower != "") & (legacy_lower != matc_lower)
+            & ~name_confirms_comp
+        )
+    else:
+        flag_legacy_disagrees = pd.Series([False] * n, index=idx)
 
     report(0.50, "Checking class consistency…")
 
@@ -622,9 +614,14 @@ def analyze_dataframe(
     if "flag_class_material_mismatch" in enabled_checks:
         # Eligible: class is non-empty AND non-BB AND composition is set AND
         # class actually names a specific material (skip generic classes).
+        # Suppressed when a higher-priority signal already confirms comp:
+        #   - name (suffix/pattern) says comp is right → class is wrong, ignore
+        #   - legacy says comp is right → class is wrong, ignore
         eligible = (
             ~is_bb_flag & (matc_lower != "") & (klass_lower != "")
             & (class_material_named != "")
+            & ~name_confirms_comp
+            & ~legacy_confirms_comp
         )
 
         # Single-composition rows: simple inequality
@@ -658,52 +655,34 @@ def analyze_dataframe(
                 + "' but Material Composition is '" + matc.loc[multi_flag.index] + "'"
             )
 
-    report(0.65, "Checking matrix Material field…")
-
-    # ── FLAG: matrix Material field mismatch ───────────────────────────────
-    flag_matrix = pd.Series([False] * n, index=idx)
-    if "flag_material_field_mismatch" in enabled_checks and col_material is not None:
-        eligible = (mat_lower != "") & (matc_lower != "")
-
-        # Single-composition: simple inequality
-        single_mismatch = eligible & ~has_multi_comp & (mat_lower != matc_lower)
-        flag_matrix |= single_mismatch
-
-        # Multi-composition: membership check (small subset)
-        multi_eligible = eligible & has_multi_comp
-        if multi_eligible.any():
-            def _multi_member(row):
-                comps = [normalize(c) for c in split_multi_composition(str(row[col_mat_comp]))]
-                return normalize(str(row[col_material])) not in comps
-            multi_mismatch = df[multi_eligible].apply(_multi_member, axis=1)
-            flag_matrix.loc[multi_mismatch.index] |= multi_mismatch.fillna(False)
-
-    # ── ISSUE: no suffix → non-Steel composition (suppressed if suffix flag
     # any_flag = OR of all issue flags (positive evidence only).
+    # Note: flag_material_field_mismatch was removed — the user took
+    # matrix-Material checking out of scope for this version.
     any_flag = (
-        flag_legacy_disagrees | flag_suffix | flag_class | flag_matrix | flag_empty
+        flag_suffix | flag_legacy_disagrees | flag_class | flag_empty
     )
 
     # ── Recommended Material (final) ────────────────────────────────────────
-    # Priority (last write wins — most → least authoritative):
-    #   1. Legacy ERP material (when present) — external authoritative source
-    #   2. Suffix-derived material on forward mismatch — name explicitly says
-    #   3. Class-named material on class mismatch — class explicitly says
-    #   4. Current Material Composition — default; trust what's there
-    #   5. Class-named material when composition is empty — best fallback
-    #   6. "Steel" — last-resort default when composition is empty AND
-    #      class doesn't name anything specific
+    # Apply overrides in REVERSE priority order so the highest-priority
+    # signal lands last (mask = last write wins). Priority per the user's
+    # directive:  Suffix/Name > Legacy > Class.
+    #
+    # Each override only fires when the corresponding flag fires — so
+    # confirming sources don't overwrite the current composition with a
+    # value the row already agrees with.
     recommended_mat = matc.copy()
-    # Empty composition: try class first, else "Steel"
+    # When composition is empty, fill with the best available hint
     blank_with_class = (matc == "") & (class_material_named != "")
     recommended_mat = recommended_mat.mask(blank_with_class, class_material_named)
+    blank_with_legacy = (matc == "") & has_legacy
+    recommended_mat = recommended_mat.mask(blank_with_legacy, legacy_mat)
     recommended_mat = recommended_mat.where(recommended_mat != "", "Steel")
-    # Class names different material → recommend that
+    # Lowest priority override: class names different material
     recommended_mat = recommended_mat.mask(flag_class, class_material_named)
-    # Forward suffix mismatch → recommend suffix-derived (overrides class)
+    # Middle priority: legacy disagrees
+    recommended_mat = recommended_mat.mask(flag_legacy_disagrees, legacy_mat)
+    # Highest priority: name (suffix or pattern) implies different material
     recommended_mat = recommended_mat.mask(forward_mismatch, expected_mat)
-    # Legacy ERP → ultimate authority
-    recommended_mat = recommended_mat.mask(has_legacy, legacy_mat)
 
     report(0.85, "Composing analysis notes…")
 
@@ -723,21 +702,15 @@ def analyze_dataframe(
         parts = parts.mask(flag_legacy_disagrees, parts + SEP + legacy_disagree_text)
 
     if "flag_suffix_mismatch" in enabled_checks:
-        # Forward suffix mismatch — only fired when class doesn't confirm
+        # Name (suffix or pattern) implies a different material than comp
         fwd_text = (
-            "Name suffix implies '" + expected_mat
+            "Name implies '" + expected_mat
             + "' but Material Composition is '" + matc + "'"
         )
         parts = parts.mask(forward_mismatch, parts + SEP + fwd_text)
 
     if "flag_class_material_mismatch" in enabled_checks:
         parts = parts.mask(flag_class, parts + SEP + class_note_text)
-
-    if "flag_material_field_mismatch" in enabled_checks and col_material is not None:
-        matrix_text = (
-            "Matrix Material '" + material + "' not in Material Composition '" + matc + "'"
-        )
-        parts = parts.mask(flag_matrix, parts + SEP + matrix_text)
 
     # Strip leading separator and replace empty → "OK"
     notes = parts.str.replace(r"^ \| ", "", regex=True)
@@ -760,11 +733,12 @@ def analyze_dataframe(
         "Set Material Composition to legacy ERP value: '" + legacy_mat + "'"
     )
 
-    # Forward suffix: composition is real, name is wrong → rename to add suffix
+    # Name implies a different material → name is the most authoritative
+    # signal, suggest changing Material Composition to match the name
     fix = fix.mask(
         forward_mismatch & (fix == ""),
-        "Either rename the part to match '" + matc + "' "
-        "OR change Material Composition to '" + expected_mat + "'"
+        "Name suggests material is '" + expected_mat
+        + "' — verify and update Material Composition to '" + expected_mat + "'"
     )
     # Class mismatch: class names a different material than composition.
     # Focus is fixing Material Composition (this version's scope), so the
@@ -773,11 +747,6 @@ def analyze_dataframe(
         flag_class & (fix == ""),
         "Class indicates '" + class_material_named
         + "' — verify and update Material Composition to '" + class_material_named + "'"
-    )
-    # Matrix Material field disagreement
-    fix = fix.mask(
-        flag_matrix & (fix == ""),
-        "Update the matrix Material field to match the Material Composition"
     )
     # Missing composition (no legacy)
     fix = fix.mask(
@@ -790,10 +759,9 @@ def analyze_dataframe(
 
     # ── Assemble result ────────────────────────────────────────────────────
     result = df.copy()
-    result["flag_legacy_disagrees"]           = flag_legacy_disagrees.astype(bool)
     result["flag_suffix_mismatch"]            = flag_suffix.astype(bool)
+    result["flag_legacy_disagrees"]           = flag_legacy_disagrees.astype(bool)
     result["flag_class_material_mismatch"]    = flag_class.astype(bool)
-    result["flag_material_field_mismatch"]    = flag_matrix.astype(bool)
     result["flag_empty_material_composition"] = flag_empty.astype(bool)
     result["flag_is_matrix_parent"]           = is_matrix_parent.astype(bool)
     result["flag_is_bb_part"]                 = is_bb_flag.astype(bool)
@@ -858,10 +826,9 @@ _C = {
 }
 
 _FRIENDLY_NAMES: dict[str, str] = {
+    "flag_suffix_mismatch":            "Name Mismatch",
     "flag_legacy_disagrees":           "Legacy ERP Mismatch",
-    "flag_suffix_mismatch":            "Suffix Mismatch",
     "flag_class_material_mismatch":    "Class Mismatch",
-    "flag_material_field_mismatch":    "Matrix Field Mismatch",
     "flag_empty_material_composition": "Missing Composition",
     "flag_is_matrix_parent":           "Matrix Parent",
     "flag_is_bb_part":                 "BB Part (Exempt)",
@@ -1173,13 +1140,14 @@ Examples:
     p.add_argument(
         "--checks", "-c",
         nargs="+",
-        choices=["suffix", "class", "matrix", "empty", "legacy", "all"],
+        choices=["suffix", "class", "empty", "legacy", "all"],
         default=["all"],
         help=(
             "Which checks to run (default: all). "
-            "'suffix' = name ↔ material; 'class' = class reflects material; "
-            "'matrix' = matrix Material field; 'empty' = missing composition; "
-            "'legacy' = legacy ERP cross-check (requires --legacy-csv). "
+            "'suffix' = name (suffix or pattern) ↔ material; "
+            "'legacy' = legacy ERP cross-check (requires --legacy-csv); "
+            "'class' = class names a different material; "
+            "'empty' = missing composition. "
             "Example: --checks suffix legacy"
         ),
     )
@@ -1198,7 +1166,6 @@ Examples:
 CHECK_NAME_TO_FLAG: dict[str, str] = {
     "suffix": "flag_suffix_mismatch",
     "class":  "flag_class_material_mismatch",
-    "matrix": "flag_material_field_mismatch",
     "empty":  "flag_empty_material_composition",
     "legacy": "flag_legacy_disagrees",
 }
