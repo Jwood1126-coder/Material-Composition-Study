@@ -4,6 +4,9 @@ A small tool that audits **Material Composition** data on NetSuite items.
 Feed it a CSV exported from a saved search and it produces a formatted Excel
 report flagging the rows that look wrong.
 
+> 📘 For a plain-English walkthrough of every rule, the recommendation
+> priority, and worked examples, see **[HOW_IT_WORKS.md](HOW_IT_WORKS.md)**.
+
 ---
 
 ## Download (Windows)

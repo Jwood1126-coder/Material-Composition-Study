@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 
 try:
     import xlsxwriter
@@ -510,10 +510,17 @@ def analyze_dataframe(
     # mismatch — if class/name explicitly name the actual composition, the
     # name's suffix is the misleading element, not the composition.
     is_alum_comp = matc_lower.isin(["aluminum", "aluminium", "aluminum alloy"])
+    # Class and name are evaluated as INDEPENDENT signals — either one alone
+    # can confirm the composition. For plain "Steel" we require the
+    # confirming signal to NOT also say "stainless" (so a stainless class
+    # doesn't accidentally confirm plain steel), but the *other* channel's
+    # contradictions don't disqualify confirmation.
     class_confirms = (
           ((matc_lower == "stainless steel") & (contains_stainless | name_says_stainless))
-        | ((matc_lower == "steel") & (contains_steel | name_says_steel)
-           & ~contains_stainless & ~name_says_stainless)
+        | ((matc_lower == "steel") & (
+              (contains_steel & ~contains_stainless)
+            | (name_says_steel & ~name_says_stainless)
+          ))
         | ((matc_lower == "brass") & (contains_brass | name_says_brass))
         | (is_alum_comp & (contains_alum | name_says_alum))
     )
@@ -581,83 +588,74 @@ def analyze_dataframe(
 
     report(0.50, "Checking class consistency…")
 
-    # ── FLAG: class doesn't reflect material ───────────────────────────────
+    # ── Class-says-which-material? ─────────────────────────────────────────
+    # The class string may name a specific material (e.g. "Hyd Fittings -
+    # Stainless"). Used for two purposes:
+    #   (1) flag_class_material_mismatch: when class names a SPECIFIC
+    #       material that disagrees with the current Material Composition,
+    #       flag the row as a candidate composition fix (NOT a class fix —
+    #       this version's focus is correcting Material Composition).
+    #   (2) Recommended Material override: when the class names a different
+    #       material than the current composition, the class becomes the
+    #       suggested replacement.
+    # Generic class strings (no recognized material keyword) produce "" and
+    # do NOT contribute a flag — absence of evidence is not evidence.
+    class_material_named = pd.Series([""] * n, index=idx, dtype=object)
+    class_material_named = class_material_named.mask(contains_stainless, "Stainless Steel")
+    class_material_named = class_material_named.mask(
+        contains_steel & ~contains_stainless & (class_material_named == ""),
+        "Steel"
+    )
+    class_material_named = class_material_named.mask(
+        contains_brass & (class_material_named == ""),
+        "Brass"
+    )
+    class_material_named = class_material_named.mask(
+        contains_alum & (class_material_named == ""),
+        "Aluminum"
+    )
+
+    # ── FLAG: class names a different material than composition ───────────
     flag_class = pd.Series([False] * n, index=idx)
     class_note_text = pd.Series([""] * n, index=idx, dtype=object)
 
     if "flag_class_material_mismatch" in enabled_checks:
-        # Blank class is a separate data-quality issue, not a class-mapping
-        # mismatch — exclude blank-class rows from this check so notes don't
-        # say "Class '' does not reflect: 'X'".
-        eligible = ~is_bb_flag & (matc_lower != "") & (klass_lower != "")
+        # Eligible: class is non-empty AND non-BB AND composition is set AND
+        # class actually names a specific material (skip generic classes).
+        eligible = (
+            ~is_bb_flag & (matc_lower != "") & (klass_lower != "")
+            & (class_material_named != "")
+        )
 
-        # Vectorized single-composition path (the common case)
+        # Single-composition rows: simple inequality
         single_eligible = eligible & ~has_multi_comp
-
-        # (contains_* keyword masks were already computed above for class_confirms)
-
-        # Stainless Steel composition: class needs "stainless"
-        ss_mat = single_eligible & (matc_lower == "stainless steel")
-        flag_class |= ss_mat & ~contains_stainless
-
-        # Plain Steel composition: class needs "steel" but NOT "stainless"
-        steel_mat = single_eligible & (matc_lower == "steel")
-        flag_class |= steel_mat & (~contains_steel | contains_stainless)
-
-        # Brass
-        brass_mat = single_eligible & (matc_lower == "brass")
-        flag_class |= brass_mat & ~contains_brass
-
-        # Aluminum / Aluminium
-        alum_mat = single_eligible & (
-            (matc_lower == "aluminum") | (matc_lower == "aluminium") | (matc_lower == "aluminum alloy")
+        single_disagree = (
+            single_eligible &
+            (class_material_named.str.lower() != matc_lower)
         )
-        flag_class |= alum_mat & ~contains_alum
-
-        # Generic substring fallback for unknown materials (single-comp only)
-        known = (matc_lower.isin([
-            "stainless steel", "steel", "brass", "aluminum", "aluminium", "aluminum alloy"
-        ]))
-        unknown_mat = single_eligible & ~known & (matc_lower != "")
-        if unknown_mat.any():
-            # row-wise unknown check (small subset)
-            def _unknown_check(row):
-                return matc_lower.at[row.name] not in klass_lower.at[row.name]
-            unknown_mismatch = df[unknown_mat].apply(_unknown_check, axis=1)
-            flag_class.loc[unknown_mismatch.index] |= unknown_mismatch.fillna(False)
-
-        # Class note text — single-comp rows
+        flag_class |= single_disagree
         class_note_text = class_note_text.mask(
-            flag_class & single_eligible,
-            "Class '" + klass + "' does not reflect: '" + matc + "'"
+            single_disagree,
+            "Class indicates '" + class_material_named
+            + "' but Material Composition is '" + matc + "'"
         )
 
-        # Multi-composition path: per-row apply (small subset)
+        # Multi-composition rows: flag when class-named material is NOT
+        # among the row's compositions
         multi_eligible = eligible & has_multi_comp
         if multi_eligible.any():
-            def _multi_check(row):
-                comps = split_multi_composition(str(row[col_mat_comp]))
-                bad = [c for c in comps if not material_matches_class(c, str(row[col_class]))]
-                return (bool(bad), bad)
-
-            sub = df[multi_eligible].apply(_multi_check, axis=1, result_type="reduce")
-            multi_flag = sub.map(lambda t: t[0])
-            multi_text = sub.map(
-                lambda t: "Class '" + "" + "' does not reflect: " +
-                          ", ".join(f"'{c}'" for c in t[1]) if t[0] else ""
-            )
-            # Re-include actual class value:
-            for i, val in sub.items():
-                ok, bad_list = val
-                if ok:
-                    multi_text.at[i] = (
-                        f"Class '{klass.at[i]}' does not reflect: "
-                        + ", ".join(f"'{c}'" for c in bad_list)
-                    )
+            def _multi_class_check(row):
+                cmn = class_material_named.at[row.name].lower()
+                if not cmn:
+                    return False
+                comps = [normalize(c) for c in split_multi_composition(str(row[col_mat_comp]))]
+                return cmn not in comps
+            multi_flag = df[multi_eligible].apply(_multi_class_check, axis=1)
             flag_class.loc[multi_flag.index] |= multi_flag.fillna(False)
-            class_note_text.loc[multi_text.index] = (
-                class_note_text.loc[multi_text.index]
-                .where(~multi_flag.fillna(False), multi_text)
+            class_note_text.loc[multi_flag.index] = class_note_text.loc[multi_flag.index].mask(
+                multi_flag.fillna(False),
+                "Class indicates '" + class_material_named.loc[multi_flag.index]
+                + "' but Material Composition is '" + matc.loc[multi_flag.index] + "'"
             )
 
     report(0.65, "Checking matrix Material field…")
@@ -687,14 +685,24 @@ def analyze_dataframe(
     )
 
     # ── Recommended Material (final) ────────────────────────────────────────
-    # Priority (most → least authoritative):
-    #   1. Legacy ERP material (when present) — authoritative source
-    #   2. Suffix-derived material when forward mismatch fires AND no other
-    #      signal confirms — the suffix is positive evidence
-    #   3. Current Material Composition — trust what's already there
-    #   4. "Steel" — only when composition is genuinely empty
-    recommended_mat = matc.where(matc != "", "Steel")
+    # Priority (last write wins — most → least authoritative):
+    #   1. Legacy ERP material (when present) — external authoritative source
+    #   2. Suffix-derived material on forward mismatch — name explicitly says
+    #   3. Class-named material on class mismatch — class explicitly says
+    #   4. Current Material Composition — default; trust what's there
+    #   5. Class-named material when composition is empty — best fallback
+    #   6. "Steel" — last-resort default when composition is empty AND
+    #      class doesn't name anything specific
+    recommended_mat = matc.copy()
+    # Empty composition: try class first, else "Steel"
+    blank_with_class = (matc == "") & (class_material_named != "")
+    recommended_mat = recommended_mat.mask(blank_with_class, class_material_named)
+    recommended_mat = recommended_mat.where(recommended_mat != "", "Steel")
+    # Class names different material → recommend that
+    recommended_mat = recommended_mat.mask(flag_class, class_material_named)
+    # Forward suffix mismatch → recommend suffix-derived (overrides class)
     recommended_mat = recommended_mat.mask(forward_mismatch, expected_mat)
+    # Legacy ERP → ultimate authority
     recommended_mat = recommended_mat.mask(has_legacy, legacy_mat)
 
     report(0.85, "Composing analysis notes…")
@@ -758,10 +766,13 @@ def analyze_dataframe(
         "Either rename the part to match '" + matc + "' "
         "OR change Material Composition to '" + expected_mat + "'"
     )
-    # Class mismatch: composition is right, class is mis-categorized
+    # Class mismatch: class names a different material than composition.
+    # Focus is fixing Material Composition (this version's scope), so the
+    # suggestion is to update the composition to match what the class says.
     fix = fix.mask(
         flag_class & (fix == ""),
-        "Reclassify the item under a class containing '" + matc + "'"
+        "Class indicates '" + class_material_named
+        + "' — verify and update Material Composition to '" + class_material_named + "'"
     )
     # Matrix Material field disagreement
     fix = fix.mask(
