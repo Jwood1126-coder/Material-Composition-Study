@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 try:
     import xlsxwriter
@@ -119,8 +119,9 @@ ISSUE_FLAGS: dict[str, str] = {
 
 # Informational flags — context only, no analysis note, do NOT trigger any_flag.
 INFO_FLAGS: dict[str, str] = {
-    "flag_is_matrix_parent": "Matrix Parent (Multiple Compositions)",
-    "flag_is_bb_part":       "Brennan Black Part (Class Check Exempt)",
+    "flag_is_matrix_parent":     "Matrix Parent (Multiple Compositions)",
+    "flag_is_bb_part":           "Brennan Black Part (Class Check Exempt)",
+    "flag_unknown_composition":  "Unknown Composition (Limited Validation)",
 }
 
 # Combined ordered dict used for display/export.
@@ -481,33 +482,47 @@ def analyze_dataframe(
     is_bb_flag  = has_bb | is_bb_class
     is_empty    = (matc_lower == "")
 
-    # ── Class & name keyword extraction (used by class check and class_confirms) ─
+    # ── Class & name keyword extraction ─────────────────────────────────────
+    # Each pattern is broken out individually so we can report exactly which
+    # signal fired on each row (see the "Matched Signal" column).
     name_lower = name.str.lower()
 
-    # Class signals
+    # Class signals — all single-purpose, no compound regexes
     contains_stainless = klass_lower.str.contains("stainless", na=False)
     contains_steel     = klass_lower.str.contains("steel",     na=False)
     contains_brass     = klass_lower.str.contains("brass",     na=False)
-    # "aerospace" classes → treat as Aluminum-confirming (industry context)
-    contains_alum      = klass_lower.str.contains(
-        r"alumin(?:um|ium)|aerospace", regex=True, na=False
-    )
+    contains_alum      = klass_lower.str.contains(r"alumin(?:um|ium)", regex=True, na=False)
+    # Aerospace is informational only — surfaced in matched_signal but does
+    # NOT confirm Aluminum (aerospace fittings can be Al, Ti, steel, etc.).
+    contains_aerospace = klass_lower.str.contains("aerospace", na=False)
 
-    # Name signals — patterns picked to match the user's actual NetSuite
-    # naming conventions seen in production exports:
-    #   ALUM VENT, BRS, BR$, 30B (digit+B at end), 316/304 alloy codes,
-    #   S/S, standalone S, etc.
-    name_says_alum = name_lower.str.contains(r"\balum", regex=True, na=False)
-    name_says_brass = name_lower.str.contains(
-        r"\bbrass\b|\bbrs\b|\bbr\b|br$|\d[bB]$",
-        regex=True, na=False
+    # Name signals — broken out per pattern for traceability
+    name_alum_word     = name_lower.str.contains(r"\balum",     regex=True, na=False)
+    name_brass_word    = name_lower.str.contains(r"\bbrass\b",  regex=True, na=False)
+    name_brs_word      = name_lower.str.contains(r"\bbrs\b",    regex=True, na=False)
+    name_br_word       = name_lower.str.contains(r"\bbr\b",     regex=True, na=False)
+    name_br_suffix     = name_lower.str.contains(r"br$",        regex=True, na=False)
+    name_digit_b       = name_lower.str.contains(r"\d[bB]$",    regex=True, na=False)
+    name_ss_word       = name_lower.str.contains(r"\bss\b",     regex=True, na=False)
+    name_sslash        = name_lower.str.contains(r"\bs/s\b",    regex=True, na=False)
+    name_316           = name_lower.str.contains(r"\b316l?\b",  regex=True, na=False)
+    name_304           = name_lower.str.contains(r"\b304l?\b",  regex=True, na=False)
+    name_stainless_word = name_lower.str.contains(r"\bstainless\b", regex=True, na=False)
+    # Tightened standalone-S: only match when the whole part name ends with
+    # "-S". Eliminates false positives like "PT-S-001" where S is mid-name.
+    name_dash_s_end    = name_lower.str.contains(r"-s$",        regex=True, na=False)
+    name_steel_word    = name_lower.str.contains(r"\bsteel\b",  regex=True, na=False)
+
+    name_says_alum = name_alum_word
+    name_says_brass = (
+        name_brass_word | name_brs_word | name_br_word
+        | name_br_suffix | name_digit_b
     )
-    name_says_stainless = name_lower.str.contains(
-        r"\bss\b|\bs/s\b|\b316l?\b|\b304l?\b|\bstainless\b"
-        r"|(?:^|[^a-z0-9])s(?:[^a-z0-9]|$)",
-        regex=True, na=False
+    name_says_stainless = (
+        name_ss_word | name_sslash | name_316 | name_304
+        | name_stainless_word | name_dash_s_end
     )
-    name_says_steel = name_lower.str.contains(r"\bsteel\b", regex=True, na=False)
+    name_says_steel = name_steel_word
 
     # Fall-through: when no suffix-derived material was set, use the name
     # patterns. Order matters when multiple patterns match — we apply most
@@ -676,13 +691,112 @@ def analyze_dataframe(
     recommended_mat = recommended_mat.mask(blank_with_class, class_material_named)
     blank_with_legacy = (matc == "") & has_legacy
     recommended_mat = recommended_mat.mask(blank_with_legacy, legacy_mat)
-    recommended_mat = recommended_mat.where(recommended_mat != "", "Steel")
+    # Mark "Steel" defaults explicitly so the user knows we're guessing.
+    # The label distinguishes a derived "Steel" recommendation (where the
+    # composition actually is Steel, or a signal said Steel) from a
+    # last-resort default with no supporting evidence at all.
+    default_used = (recommended_mat == "")
+    recommended_mat = recommended_mat.where(~default_used, "Steel (default — no signal)")
     # Lowest priority override: class names different material
     recommended_mat = recommended_mat.mask(flag_class, class_material_named)
     # Middle priority: legacy disagrees
     recommended_mat = recommended_mat.mask(flag_legacy_disagrees, legacy_mat)
     # Highest priority: name (suffix or pattern) implies different material
     recommended_mat = recommended_mat.mask(forward_mismatch, expected_mat)
+
+    # ── Matched Signal text (for transparency / false-positive auditing) ──
+    # Build a per-row description of which signals fired. Lets a human
+    # eyeball a flagged row and immediately see why — catches the worst
+    # regex-misfire false positives.
+    name_signal_text = pd.Series([""] * n, index=idx, dtype=object)
+    # Suffix-based (highest priority — applied first so they're not overwritten)
+    name_signal_text = name_signal_text.mask(has_ss, "-SS suffix")
+    name_signal_text = name_signal_text.mask(
+        has_b_suffix & ~has_ss & (name_signal_text == ""), "-B last segment"
+    )
+    name_signal_text = name_signal_text.mask(
+        has_d & ~has_ss & ~has_b_suffix & (name_signal_text == ""), "-D segment"
+    )
+    # Stainless name patterns
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_316,           "316 alloy code"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_304,           "304 alloy code"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_sslash,        "S/S pattern"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_ss_word,       "SS keyword"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_stainless_word,"'stainless' keyword"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_dash_s_end,    "-S last segment"
+    )
+    # Aluminum
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_alum_word,     "'alum' keyword"
+    )
+    # Brass
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_brass_word,    "'brass' keyword"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_brs_word,      "'brs' keyword"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_br_word,       "'br' word"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_br_suffix,     "'br' at end of name"
+    )
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_digit_b,       "digit+B at end of name"
+    )
+    # Steel
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_steel_word,    "'steel' keyword"
+    )
+
+    # Class signal — material the class names (or "aerospace" as informational)
+    class_signal_text = class_material_named.copy()
+    class_signal_text = class_signal_text.mask(
+        (class_signal_text == "") & contains_aerospace,
+        "aerospace (informational only)"
+    )
+
+    # Compose the Matched Signal column
+    SIGSEP = " | "
+    matched_signal = pd.Series([""] * n, index=idx, dtype=object)
+    matched_signal = matched_signal.mask(
+        name_signal_text != "",
+        matched_signal + SIGSEP + "name: " + name_signal_text
+    )
+    matched_signal = matched_signal.mask(
+        has_legacy,
+        matched_signal + SIGSEP + "legacy: " + legacy_mat
+    )
+    matched_signal = matched_signal.mask(
+        class_signal_text != "",
+        matched_signal + SIGSEP + "class: " + class_signal_text
+    )
+    matched_signal = matched_signal.str.replace(r"^ \| ", "", regex=True)
+    matched_signal = matched_signal.where(matched_signal != "", "—")
+
+    # ── Unknown-composition info flag (data quality) ───────────────────────
+    # When the composition isn't one of our known materials, only the
+    # substring class check applied — limited validation. Surface this so
+    # the user knows which rows had weaker scrutiny.
+    KNOWN_MATERIALS = {
+        "stainless steel", "steel", "brass",
+        "aluminum", "aluminium", "aluminum alloy",
+    }
+    flag_unknown_composition = (
+        (matc_lower != "") & ~matc_lower.isin(KNOWN_MATERIALS)
+    )
 
     report(0.85, "Composing analysis notes…")
 
@@ -765,9 +879,11 @@ def analyze_dataframe(
     result["flag_empty_material_composition"] = flag_empty.astype(bool)
     result["flag_is_matrix_parent"]           = is_matrix_parent.astype(bool)
     result["flag_is_bb_part"]                 = is_bb_flag.astype(bool)
+    result["flag_unknown_composition"]        = flag_unknown_composition.astype(bool)
     result["legacy_material"]                 = legacy_mat
     result["recommended_material"]            = recommended_mat
     result["expected_material_from_name"]     = expected_mat
+    result["matched_signal"]                  = matched_signal
     result["analysis_notes"]                  = notes
     result["suggested_fix"]                   = fix
     result["any_flag"]                        = any_flag.astype(bool)
@@ -832,10 +948,12 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "flag_empty_material_composition": "Missing Composition",
     "flag_is_matrix_parent":           "Matrix Parent",
     "flag_is_bb_part":                 "BB Part (Exempt)",
+    "flag_unknown_composition":        "Unknown Composition",
     "any_flag":                        "Has Issue",
     "legacy_material":                 "Legacy ERP Material",
     "recommended_material":            "Recommended Material",
     "expected_material_from_name":     "Suffix-Detected Material",
+    "matched_signal":                  "Matched Signal",
     "analysis_notes":                  "Analysis Notes",
     "suggested_fix":                   "Suggested Fix",
 }
@@ -869,8 +987,8 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
 
     # ── Column ordering ────────────────────────────────────────────────────
     derived_cols   = ["legacy_material", "recommended_material",
-                      "expected_material_from_name", "suggested_fix",
-                      "analysis_notes"]
+                      "expected_material_from_name", "matched_signal",
+                      "suggested_fix", "analysis_notes"]
     source_cols = [
         c for c in df.columns
         if c not in FLAG_COLS + ["any_flag"] + derived_cols
@@ -1059,6 +1177,8 @@ def _write_data_sheet_xlsx(ws, df: pd.DataFrame, fmt: dict, on_chunk_written) ->
             ws.set_column(col_idx, col_idx, 16, fmt["center"])
         elif c in ("recommended_material", "expected_material_from_name", "legacy_material"):
             ws.set_column(col_idx, col_idx, 26)
+        elif c == "matched_signal":
+            ws.set_column(col_idx, col_idx, 45, fmt["notes"])
         else:
             if n_rows > 0:
                 lengths = df[c].head(sample_size).astype(str).str.len()
