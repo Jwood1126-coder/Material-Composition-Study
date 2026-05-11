@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 try:
     import xlsxwriter
@@ -113,6 +113,7 @@ EXEMPT_CLASS_SUBSTRINGS: list[str] = [
 ISSUE_FLAGS: dict[str, str] = {
     "flag_suffix_mismatch":            "Name Suffix ↔ Material Mismatch",
     "flag_legacy_disagrees":           "Legacy ERP Disagrees with Material Composition",
+    "flag_name_legacy_conflict":       "Name Signal and Legacy ERP Disagree (Review)",
     "flag_class_material_mismatch":    "Class Names Different Material",
     "flag_empty_material_composition": "Missing Material Composition",
 }
@@ -448,21 +449,31 @@ def analyze_dataframe(
             .str.split("-")
             .map(lambda s: [seg.strip() for seg in s if seg.strip()] if isinstance(s, list) else [])
     )
-    has_ss        = segments.map(lambda s: "SS" in s)
-    has_bb        = segments.map(lambda s: "BB" in s)
-    has_d         = segments.map(lambda s: "D" in s)   # D anywhere as own segment (e.g. -D-GREEN)
-    last_seg      = segments.map(lambda s: s[-1] if s else "")
+    # ── Material signals must appear in the LAST 3 segments only ───────────
+    # Per user directive: "Materials usually are near the end of the part,
+    # perhaps in the last 3 segments max, never earlier." This eliminates
+    # false positives like "D-0306-08" or "STEEL-COUPLER-IS-BEST-08" where
+    # a material-like word appears too early to be the material indicator.
+    last_3_segs  = segments.map(lambda s: s[-3:] if s else [])
+    last_3_text  = last_3_segs.map(lambda s: " ".join(s).lower() if s else "")
+    last_seg     = segments.map(lambda s: s[-1] if s else "")
+
+    has_ss        = last_3_segs.map(lambda s: "SS" in s)
+    has_d         = last_3_segs.map(lambda s: "D"  in s)
+    has_zn        = last_3_segs.map(lambda s: "ZN" in s)   # zinc plated → Steel
+    has_bb        = segments.map(lambda s: "BB" in s)      # BB anywhere — class exemption
     has_b_suffix  = (last_seg == "B")    # exact -B (not -BB)
 
-    # Expected material from NAME (suffix first, then broader name patterns).
-    # The full hierarchy: SS-segment > -B last seg > D-segment > name patterns.
-    # Name patterns fill in when no suffix is present, so e.g. "200-24BR"
-    # (Brass per "BR" pattern) flows through the same forward-mismatch rule
-    # as a literal -B suffix.
+    # Expected material from NAME signals. Priority:
+    #   SS segment > -B last seg > D segment > -ZN segment (→ Steel) > keywords
+    # All restricted to last-3 scope.
     expected_mat = pd.Series([""] * n, index=idx, dtype=object)
     expected_mat = expected_mat.mask(has_ss, "Stainless Steel")
     expected_mat = expected_mat.mask(~has_ss & has_b_suffix, "Brass")
     expected_mat = expected_mat.mask(~has_ss & ~has_b_suffix & has_d, "Aluminum")
+    expected_mat = expected_mat.mask(
+        ~has_ss & ~has_b_suffix & ~has_d & has_zn, "Steel"  # zinc plated = steel base
+    )
 
     # `recommended_mat` is finalized after class_confirms / legacy / forward
     # mismatch are all known — placeholder; real value is set below.
@@ -496,33 +507,23 @@ def analyze_dataframe(
     # NOT confirm Aluminum (aerospace fittings can be Al, Ti, steel, etc.).
     contains_aerospace = klass_lower.str.contains("aerospace", na=False)
 
-    # Name signals — broken out per pattern for traceability
-    name_alum_word     = name_lower.str.contains(r"\balum",     regex=True, na=False)
-    name_brass_word    = name_lower.str.contains(r"\bbrass\b",  regex=True, na=False)
-    name_brs_word      = name_lower.str.contains(r"\bbrs\b",    regex=True, na=False)
-    name_br_word       = name_lower.str.contains(r"\bbr\b",     regex=True, na=False)
-    name_br_suffix     = name_lower.str.contains(r"br$",        regex=True, na=False)
-    name_digit_b       = name_lower.str.contains(r"\d[bB]$",    regex=True, na=False)
-    name_ss_word       = name_lower.str.contains(r"\bss\b",     regex=True, na=False)
-    name_sslash        = name_lower.str.contains(r"\bs/s\b",    regex=True, na=False)
-    name_316           = name_lower.str.contains(r"\b316l?\b",  regex=True, na=False)
-    name_304           = name_lower.str.contains(r"\b304l?\b",  regex=True, na=False)
-    name_stainless_word = name_lower.str.contains(r"\bstainless\b", regex=True, na=False)
-    # Tightened standalone-S: only match when the whole part name ends with
-    # "-S". Eliminates false positives like "PT-S-001" where S is mid-name.
-    name_dash_s_end    = name_lower.str.contains(r"-s$",        regex=True, na=False)
-    name_steel_word    = name_lower.str.contains(r"\bsteel\b",  regex=True, na=False)
+    # ── Name keyword signals — STRICT and restricted to last 3 segments ────
+    # Per user directives:
+    #   - Stainless: ONLY a literal "-SS" segment. Period.
+    #   - Brass: ONLY a literal "-B" final segment. B must stand alone, not
+    #     combined with other letters (no "BR", "HNBR", "30B", etc.).
+    #   - Aluminum: literal "-D" segment OR the "alum" keyword (in last 3 segs).
+    #   - Steel: literal "-ZN" segment (zinc plated) OR the "steel" keyword
+    #     (in last 3 segs).
+    # All keyword matches use last_3_text so a part name like "STEEL-IS-X-Y-08"
+    # would NOT match (STEEL is too early).
+    name_alum_word  = last_3_text.str.contains(r"\balum",   regex=True, na=False)
+    name_steel_word = last_3_text.str.contains(r"\bsteel\b", regex=True, na=False)
 
-    name_says_alum = name_alum_word
-    name_says_brass = (
-        name_brass_word | name_brs_word | name_br_word
-        | name_br_suffix | name_digit_b
-    )
-    name_says_stainless = (
-        name_ss_word | name_sslash | name_316 | name_304
-        | name_stainless_word | name_dash_s_end
-    )
-    name_says_steel = name_steel_word
+    name_says_alum      = name_alum_word
+    name_says_brass     = pd.Series([False] * n, index=idx)   # only has_b_suffix
+    name_says_stainless = pd.Series([False] * n, index=idx)   # only has_ss
+    name_says_steel     = name_steel_word
 
     # Fall-through: when no suffix-derived material was set, use the name
     # patterns. Order matters when multiple patterns match — we apply most
@@ -670,11 +671,24 @@ def analyze_dataframe(
                 + "' but Material Composition is '" + matc.loc[multi_flag.index] + "'"
             )
 
+    # ── FLAG: name vs legacy conflict ──────────────────────────────────────
+    # Fires when the name signal (suffix or keyword) and the legacy ERP
+    # disagree about the material, regardless of which (if any) agrees with
+    # the current composition. Surfaces the case where both sources are
+    # present but say different things — review which is correct.
+    name_signal_present = (expected_mat != "")
+    name_legacy_conflict = (
+        name_signal_present & has_legacy & (expected_lower != legacy_lower)
+    )
+    if "flag_name_legacy_conflict" in enabled_checks:
+        flag_name_legacy_conflict = name_legacy_conflict
+    else:
+        flag_name_legacy_conflict = pd.Series([False] * n, index=idx)
+
     # any_flag = OR of all issue flags (positive evidence only).
-    # Note: flag_material_field_mismatch was removed — the user took
-    # matrix-Material checking out of scope for this version.
     any_flag = (
-        flag_suffix | flag_legacy_disagrees | flag_class | flag_empty
+        flag_suffix | flag_legacy_disagrees | flag_name_legacy_conflict
+        | flag_class | flag_empty
     )
 
     # ── Recommended Material (final) ────────────────────────────────────────
@@ -686,22 +700,30 @@ def analyze_dataframe(
     # confirming sources don't overwrite the current composition with a
     # value the row already agrees with.
     recommended_mat = matc.copy()
-    # When composition is empty, fill with the best available hint
-    blank_with_class = (matc == "") & (class_material_named != "")
+    # ── Blank composition: conservative estimate from the SAME rules ───────
+    # No generic "Steel" default. We only estimate when there's actual
+    # evidence to draw on. Priority for blanks (least → most authoritative):
+    #   1. Class names a material
+    #   2. Legacy ERP has a value
+    #   3. Name (suffix or keyword) implies a material
+    # If NO signal is available, leave the recommendation BLANK — per user
+    # directive: "Be ok with not giving a recommendation. If there is no
+    # clear signal, leave it blank."
+    blank = (matc == "")
+    blank_with_class = blank & (class_material_named != "")
     recommended_mat = recommended_mat.mask(blank_with_class, class_material_named)
-    blank_with_legacy = (matc == "") & has_legacy
+    blank_with_legacy = blank & has_legacy
     recommended_mat = recommended_mat.mask(blank_with_legacy, legacy_mat)
-    # Mark "Steel" defaults explicitly so the user knows we're guessing.
-    # The label distinguishes a derived "Steel" recommendation (where the
-    # composition actually is Steel, or a signal said Steel) from a
-    # last-resort default with no supporting evidence at all.
-    default_used = (recommended_mat == "")
-    recommended_mat = recommended_mat.where(~default_used, "Steel (default — no signal)")
-    # Lowest priority override: class names different material
+    blank_with_name = blank & (expected_mat != "")
+    recommended_mat = recommended_mat.mask(blank_with_name, expected_mat)
+    # Remember which rows ended up with no estimate (for confidence + fix text)
+    no_estimate = (recommended_mat == "")
+
+    # ── Override-based recommendations on rows where the composition IS set
+    # but a higher-priority signal says it's wrong ──────────────────────
+    # Apply in reverse priority order (last write wins).
     recommended_mat = recommended_mat.mask(flag_class, class_material_named)
-    # Middle priority: legacy disagrees
     recommended_mat = recommended_mat.mask(flag_legacy_disagrees, legacy_mat)
-    # Highest priority: name (suffix or pattern) implies different material
     recommended_mat = recommended_mat.mask(forward_mismatch, expected_mat)
 
     # ── Matched Signal text (for transparency / false-positive auditing) ──
@@ -709,57 +731,29 @@ def analyze_dataframe(
     # eyeball a flagged row and immediately see why — catches the worst
     # regex-misfire false positives.
     name_signal_text = pd.Series([""] * n, index=idx, dtype=object)
-    # Suffix-based (highest priority — applied first so they're not overwritten)
-    name_signal_text = name_signal_text.mask(has_ss, "-SS suffix")
+    # Literal suffix signals (highest priority — applied first)
+    name_signal_text = name_signal_text.mask(has_ss, "-SS segment")
     name_signal_text = name_signal_text.mask(
-        has_b_suffix & ~has_ss & (name_signal_text == ""), "-B last segment"
+        has_b_suffix & ~has_ss & (name_signal_text == ""), "-B segment"
     )
     name_signal_text = name_signal_text.mask(
         has_d & ~has_ss & ~has_b_suffix & (name_signal_text == ""), "-D segment"
     )
-    # Stainless name patterns
     name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_316,           "316 alloy code"
+        has_zn & ~has_ss & ~has_b_suffix & ~has_d & (name_signal_text == ""),
+        "-ZN segment (zinc plated)"
+    )
+    # Keyword signals (last 3 segments only)
+    name_signal_text = name_signal_text.mask(
+        (name_signal_text == "") & name_alum_word,  "'alum' keyword"
     )
     name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_304,           "304 alloy code"
+        (name_signal_text == "") & name_steel_word, "'steel' keyword"
     )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_sslash,        "S/S pattern"
-    )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_ss_word,       "SS keyword"
-    )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_stainless_word,"'stainless' keyword"
-    )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_dash_s_end,    "-S last segment"
-    )
-    # Aluminum
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_alum_word,     "'alum' keyword"
-    )
-    # Brass
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_brass_word,    "'brass' keyword"
-    )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_brs_word,      "'brs' keyword"
-    )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_br_word,       "'br' word"
-    )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_br_suffix,     "'br' at end of name"
-    )
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_digit_b,       "digit+B at end of name"
-    )
-    # Steel
-    name_signal_text = name_signal_text.mask(
-        (name_signal_text == "") & name_steel_word,    "'steel' keyword"
-    )
+
+    # Boolean masks used by confidence scoring below
+    literal_suffix_signal = (has_ss | has_b_suffix | has_d | has_zn)
+    keyword_signal = (name_alum_word | name_steel_word)
 
     # Class signal — material the class names (or "aerospace" as informational)
     class_signal_text = class_material_named.copy()
@@ -785,6 +779,68 @@ def analyze_dataframe(
     )
     matched_signal = matched_signal.str.replace(r"^ \| ", "", regex=True)
     matched_signal = matched_signal.where(matched_signal != "", "—")
+
+    # ── Confidence column (concordance-based) ──────────────────────────────
+    # The recommended material is supported by some combination of three
+    # signals: name (suffix or keyword), legacy ERP, class. Confidence is
+    # a function of WHICH supported it and HOW MANY agreed.
+    #
+    #   HIGH:   2+ signals agree on the recommendation, OR a literal suffix
+    #           (-SS, -B, -D, -ZN) supports it with no contradicting source.
+    #   MEDIUM: A single legacy match OR a keyword name signal stands alone.
+    #           Also: HIGH downgraded when name and legacy disagree.
+    #   LOW:    Class is the only supporting signal.
+    #   blank:  No flag fires (row is OK) or no signal at all (blank row
+    #           with nothing to estimate from).
+    rec_lower = recommended_mat.str.lower()
+    name_signal_present  = (expected_mat != "")
+    name_supports_rec    = name_signal_present & (expected_lower == rec_lower)
+    legacy_supports_rec  = has_legacy & (legacy_lower == rec_lower)
+    class_supports_rec   = (class_material_named != "") & (class_material_named.str.lower() == rec_lower)
+    n_supporting = (
+        name_supports_rec.astype(int)
+        + legacy_supports_rec.astype(int)
+        + class_supports_rec.astype(int)
+    )
+
+    confidence = pd.Series([""] * n, index=idx, dtype=object)
+    # Rows that get a confidence rating: anything flagged (we made a
+    # recommendation) AND the recommendation is not blank.
+    needs = any_flag & (recommended_mat != "")
+
+    # Apply lowest → highest (last write wins).
+    # LOW: class is the only supporting signal
+    confidence = confidence.mask(
+        needs & class_supports_rec & ~legacy_supports_rec & ~name_supports_rec,
+        "Low"
+    )
+    # MEDIUM: legacy alone OR keyword name alone
+    confidence = confidence.mask(
+        needs & legacy_supports_rec & ~name_supports_rec,
+        "Medium"
+    )
+    confidence = confidence.mask(
+        needs & name_supports_rec & keyword_signal & ~literal_suffix_signal & ~legacy_supports_rec,
+        "Medium"
+    )
+    # HIGH: literal suffix supporting, OR multiple sources agreeing
+    confidence = confidence.mask(
+        needs & literal_suffix_signal & name_supports_rec,
+        "High"
+    )
+    confidence = confidence.mask(
+        needs & (n_supporting >= 2),
+        "High"
+    )
+    # Conflict downgrade: when name signal and legacy ERP disagree on the
+    # material (one of them is wrong), confidence drops.
+    confidence = confidence.mask(
+        needs & flag_name_legacy_conflict,
+        "Medium"
+    )
+
+    # (name_legacy_conflict and flag_name_legacy_conflict were computed
+    # earlier — before any_flag — so the flag can contribute to it.)
 
     # ── Unknown-composition info flag (data quality) ───────────────────────
     # When the composition isn't one of our known materials, only the
@@ -816,12 +872,26 @@ def analyze_dataframe(
         parts = parts.mask(flag_legacy_disagrees, parts + SEP + legacy_disagree_text)
 
     if "flag_suffix_mismatch" in enabled_checks:
-        # Name (suffix or pattern) implies a different material than comp
+        # Name (suffix or keyword) implies a different material than comp
         fwd_text = (
             "Name implies '" + expected_mat
             + "' but Material Composition is '" + matc + "'"
         )
         parts = parts.mask(forward_mismatch, parts + SEP + fwd_text)
+
+    # Name vs Legacy conflict — fires whenever the two disagree, even when
+    # neither is in conflict with the composition itself. Legacy is usually
+    # right too, so the user should look at these.
+    if "flag_name_legacy_conflict" in enabled_checks:
+        conflict_warning = (
+            "Name signal says '" + expected_mat
+            + "' but Legacy ERP says '" + legacy_mat
+            + "' — investigate which is correct"
+        )
+        parts = parts.mask(
+            flag_name_legacy_conflict,
+            parts + SEP + conflict_warning
+        )
 
     if "flag_class_material_mismatch" in enabled_checks:
         parts = parts.mask(flag_class, parts + SEP + class_note_text)
@@ -841,10 +911,33 @@ def analyze_dataframe(
         "Legacy ERP says '" + legacy_mat
         + "' — verify and update Material Composition to match (or correct legacy if NetSuite is right)"
     )
-    # Composition empty but legacy has a value — populate from legacy
+    # Name vs Legacy conflict — when both signals are present but disagree
     fix = fix.mask(
-        flag_empty & has_legacy & (fix == ""),
-        "Set Material Composition to legacy ERP value: '" + legacy_mat + "'"
+        flag_name_legacy_conflict & (fix == ""),
+        "Name says '" + expected_mat + "' but Legacy ERP says '" + legacy_mat
+        + "' — investigate which source is correct before changing composition"
+    )
+
+    # Composition empty — give an evidence-based estimate per priority:
+    # name signal > legacy > class > (no estimate)
+    fix = fix.mask(
+        flag_empty & no_estimate & (fix == ""),
+        "Material Composition is blank and no name/legacy/class signal — manual review needed"
+    )
+    fix = fix.mask(
+        flag_empty & blank_with_class & ~has_legacy & ~name_signal_present & (fix == ""),
+        "Material Composition is blank; class indicates '" + class_material_named
+        + "' — verify and set to this value"
+    )
+    fix = fix.mask(
+        flag_empty & has_legacy & ~name_signal_present & (fix == ""),
+        "Material Composition is blank; legacy ERP says '" + legacy_mat
+        + "' — set to this value"
+    )
+    fix = fix.mask(
+        flag_empty & name_signal_present & (fix == ""),
+        "Material Composition is blank; name suggests '" + expected_mat
+        + "' — verify and set to this value"
     )
 
     # Name implies a different material → name is the most authoritative
@@ -875,6 +968,7 @@ def analyze_dataframe(
     result = df.copy()
     result["flag_suffix_mismatch"]            = flag_suffix.astype(bool)
     result["flag_legacy_disagrees"]           = flag_legacy_disagrees.astype(bool)
+    result["flag_name_legacy_conflict"]       = flag_name_legacy_conflict.astype(bool)
     result["flag_class_material_mismatch"]    = flag_class.astype(bool)
     result["flag_empty_material_composition"] = flag_empty.astype(bool)
     result["flag_is_matrix_parent"]           = is_matrix_parent.astype(bool)
@@ -884,6 +978,7 @@ def analyze_dataframe(
     result["recommended_material"]            = recommended_mat
     result["expected_material_from_name"]     = expected_mat
     result["matched_signal"]                  = matched_signal
+    result["confidence"]                      = confidence
     result["analysis_notes"]                  = notes
     result["suggested_fix"]                   = fix
     result["any_flag"]                        = any_flag.astype(bool)
@@ -944,6 +1039,7 @@ _C = {
 _FRIENDLY_NAMES: dict[str, str] = {
     "flag_suffix_mismatch":            "Name Mismatch",
     "flag_legacy_disagrees":           "Legacy ERP Mismatch",
+    "flag_name_legacy_conflict":       "Name ↔ Legacy Conflict",
     "flag_class_material_mismatch":    "Class Mismatch",
     "flag_empty_material_composition": "Missing Composition",
     "flag_is_matrix_parent":           "Matrix Parent",
@@ -954,6 +1050,7 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "recommended_material":            "Recommended Material",
     "expected_material_from_name":     "Suffix-Detected Material",
     "matched_signal":                  "Matched Signal",
+    "confidence":                      "Confidence",
     "analysis_notes":                  "Analysis Notes",
     "suggested_fix":                   "Suggested Fix",
 }
@@ -988,7 +1085,7 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
     # ── Column ordering ────────────────────────────────────────────────────
     derived_cols   = ["legacy_material", "recommended_material",
                       "expected_material_from_name", "matched_signal",
-                      "suggested_fix", "analysis_notes"]
+                      "confidence", "suggested_fix", "analysis_notes"]
     source_cols = [
         c for c in df.columns
         if c not in FLAG_COLS + ["any_flag"] + derived_cols
@@ -1179,6 +1276,8 @@ def _write_data_sheet_xlsx(ws, df: pd.DataFrame, fmt: dict, on_chunk_written) ->
             ws.set_column(col_idx, col_idx, 26)
         elif c == "matched_signal":
             ws.set_column(col_idx, col_idx, 45, fmt["notes"])
+        elif c == "confidence":
+            ws.set_column(col_idx, col_idx, 18, fmt["center"])
         else:
             if n_rows > 0:
                 lengths = df[c].head(sample_size).astype(str).str.len()
