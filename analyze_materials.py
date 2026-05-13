@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.12.2"
+__version__ = "1.12.3"
 
 try:
     import xlsxwriter
@@ -537,6 +537,33 @@ def analyze_dataframe(
         catsy_mat = pd.Series([""] * n, index=idx, dtype=object)
     catsy_lower = catsy_mat.str.lower()
     has_catsy   = catsy_lower != ""
+
+    # ── Catsy vs NetSuite raw comparison column ────────────────────────────
+    # Independent of any flag/suppression logic. Lets the user autofilter
+    # directly on "Mismatch", "Catsy blank", "NetSuite blank" without
+    # having to interpret the priority rules. Shows nothing when no Catsy
+    # CSV was loaded (keeps the column unobtrusive in legacy-only runs).
+    ns_filled    = (matc.str.strip() != "")
+    catsy_filled = has_catsy
+    if catsy_lookup:
+        catsy_vs_netsuite = pd.Series(["—"] * n, index=idx, dtype=object)
+        catsy_vs_netsuite = catsy_vs_netsuite.mask(
+            ns_filled & catsy_filled & (matc.str.lower() == catsy_lower), "Match"
+        )
+        catsy_vs_netsuite = catsy_vs_netsuite.mask(
+            ns_filled & catsy_filled & (matc.str.lower() != catsy_lower), "Mismatch"
+        )
+        catsy_vs_netsuite = catsy_vs_netsuite.mask(
+            ns_filled & ~catsy_filled, "Catsy blank"
+        )
+        catsy_vs_netsuite = catsy_vs_netsuite.mask(
+            ~ns_filled & catsy_filled, "NetSuite blank"
+        )
+        catsy_vs_netsuite = catsy_vs_netsuite.mask(
+            ~ns_filled & ~catsy_filled, "Both blank"
+        )
+    else:
+        catsy_vs_netsuite = pd.Series([""] * n, index=idx, dtype=object)
 
     report(0.10, "Parsing names…")
 
@@ -1153,6 +1180,7 @@ def analyze_dataframe(
     result["flag_unknown_composition"]        = flag_unknown_composition.astype(bool)
     result["legacy_material"]                 = legacy_mat
     result["catsy_material"]                  = catsy_mat
+    result["catsy_vs_netsuite"]               = catsy_vs_netsuite
     result["recommended_material"]            = recommended_mat
     result["expected_material_from_name"]     = expected_mat
     result["matched_signal"]                  = matched_signal
@@ -1228,6 +1256,7 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "any_flag":                        "Has Issue",
     "legacy_material":                 "Legacy ERP Material",
     "catsy_material":                  "Catsy PIM Material",
+    "catsy_vs_netsuite":               "Catsy vs NetSuite",
     "recommended_material":            "Recommended Material",
     "expected_material_from_name":     "Suffix-Detected Material",
     "matched_signal":                  "Matched Signal",
@@ -1264,7 +1293,7 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
                 pass
 
     # ── Column ordering ────────────────────────────────────────────────────
-    derived_cols   = ["legacy_material", "catsy_material",
+    derived_cols   = ["legacy_material", "catsy_material", "catsy_vs_netsuite",
                       "recommended_material",
                       "expected_material_from_name", "matched_signal",
                       "confidence", "suggested_fix", "analysis_notes"]
@@ -1469,6 +1498,8 @@ def _write_data_sheet_xlsx(ws, df: pd.DataFrame, fmt: dict, on_chunk_written) ->
         elif c == "matched_signal":
             ws.set_column(col_idx, col_idx, 45, fmt["notes"])
         elif c == "confidence":
+            ws.set_column(col_idx, col_idx, 18, fmt["center"])
+        elif c == "catsy_vs_netsuite":
             ws.set_column(col_idx, col_idx, 18, fmt["center"])
         else:
             if n_rows > 0:
