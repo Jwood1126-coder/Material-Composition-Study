@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.12.0"
+__version__ = "1.12.1"
 
 try:
     import xlsxwriter
@@ -497,26 +497,38 @@ def analyze_dataframe(
     matc_lower  = matc.str.lower()
     mat_lower   = material.str.lower()
 
+    # NetSuite matrix children carry the parent prefix in their Name —
+    # e.g. "NS2404:NS2404-12-06-SS". Catsy and legacy ERP typically store
+    # just the child SKU ("NS2404-12-06-SS"), so we also try the post-colon
+    # portion of Name when looking up cross-references. rsplit with n=1
+    # takes everything AFTER the last colon; for rows without a colon the
+    # result equals the full name, so the fallback is a no-op there.
+    name_lower            = name.str.lower()
+    name_child_lower      = name_lower.str.rsplit(":", n=1).str[-1]
+
     # ── Legacy ERP lookup ──────────────────────────────────────────────────
-    # Match each row by External ID first, then by Name. legacy_material is
-    # the cleaned legacy ERP material string (or "" when no match).
+    # Tried in order: External ID, full Name, matrix-child portion of Name.
     if legacy_lookup:
         ext_lower  = ext_id.str.lower()
-        name_lower_for_lookup = name.str.lower()
-        legacy_via_ext  = ext_lower.map(legacy_lookup).fillna("")
-        legacy_via_name = name_lower_for_lookup.map(legacy_lookup).fillna("")
-        legacy_mat = legacy_via_ext.where(legacy_via_ext != "", legacy_via_name)
+        legacy_via_ext   = ext_lower.map(legacy_lookup).fillna("")
+        legacy_via_name  = name_lower.map(legacy_lookup).fillna("")
+        legacy_via_child = name_child_lower.map(legacy_lookup).fillna("")
+        legacy_mat = legacy_via_ext.where(legacy_via_ext   != "", legacy_via_name)
+        legacy_mat = legacy_mat.where(legacy_mat           != "", legacy_via_child)
     else:
         legacy_mat = pd.Series([""] * n, index=idx, dtype=object)
     legacy_lower = legacy_mat.str.lower()
     has_legacy   = legacy_lower != ""
 
     # ── Catsy PIM lookup ───────────────────────────────────────────────────
-    # Parallel cross-reference to Legacy ERP. Matched by Name only (Catsy's
-    # "Items" column is the part number, which corresponds to NetSuite Name).
+    # Parallel cross-reference to Legacy ERP. Tried in order: full Name,
+    # then the matrix-child portion of Name (text after the last colon)
+    # so matrix items in NetSuite ("PARENT:CHILD") match Catsy rows that
+    # store only the child SKU.
     if catsy_lookup:
-        name_lower_for_catsy = name.str.lower()
-        catsy_mat = name_lower_for_catsy.map(catsy_lookup).fillna("")
+        catsy_via_name  = name_lower.map(catsy_lookup).fillna("")
+        catsy_via_child = name_child_lower.map(catsy_lookup).fillna("")
+        catsy_mat = catsy_via_name.where(catsy_via_name != "", catsy_via_child)
     else:
         catsy_mat = pd.Series([""] * n, index=idx, dtype=object)
     catsy_lower = catsy_mat.str.lower()
