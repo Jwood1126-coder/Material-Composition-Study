@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.12.1"
+__version__ = "1.12.2"
 
 try:
     import xlsxwriter
@@ -497,14 +497,18 @@ def analyze_dataframe(
     matc_lower  = matc.str.lower()
     mat_lower   = material.str.lower()
 
-    # NetSuite matrix children carry the parent prefix in their Name —
-    # e.g. "NS2404:NS2404-12-06-SS". Catsy and legacy ERP typically store
-    # just the child SKU ("NS2404-12-06-SS"), so we also try the post-colon
-    # portion of Name when looking up cross-references. rsplit with n=1
-    # takes everything AFTER the last colon; for rows without a colon the
-    # result equals the full name, so the fallback is a no-op there.
+    # NetSuite matrix children carry the parent prefix in their Name. Two
+    # delimiter styles seen in real exports:
+    #   "PARENT:CHILD"     — no spaces
+    #   "PARENT : CHILD"   — spaces around the colon (NetSuite default)
+    # Catsy and legacy ERP store only the child SKU, so we also try the
+    # post-colon portion of Name when looking up cross-references. rsplit
+    # with n=1 takes everything AFTER the last colon, and .strip() drops
+    # the leading space from the spaced-colon variant. For rows without a
+    # colon the result equals the full name, so the fallback is a no-op
+    # there.
     name_lower            = name.str.lower()
-    name_child_lower      = name_lower.str.rsplit(":", n=1).str[-1]
+    name_child_lower      = name_lower.str.rsplit(":", n=1).str[-1].str.strip()
 
     # ── Legacy ERP lookup ──────────────────────────────────────────────────
     # Tried in order: External ID, full Name, matrix-child portion of Name.
