@@ -1,338 +1,439 @@
 # How the Material Composition Analyzer Works
 
 A plain-English walkthrough of what the program does, what it flags, and why.
+Written so a non-technical reader can read this top to bottom and verify the
+logic without reading any code.
 
 ---
 
-## 1. The big picture
+## 1. What the program is for
 
-You give the analyzer a CSV exported from a NetSuite saved search. For every
-item in that export, it looks at:
+You give it a CSV exported from a NetSuite saved search. It looks at every
+item and decides whether the **Material Composition** field on that item is
+probably wrong. It writes the result to an Excel workbook so a human can
+review the flagged rows.
 
-- **Name** (the part number, e.g. `0306-08-SS`)
-- **External ID** (used for matching the legacy ERP file)
-- **Class** (the NetSuite categorization, e.g. "Hydraulic Fittings - Stainless")
-- **Material Composition** (the field this program is auditing)
+It is intentionally conservative. The goal is to do most of the work of
+finding wrong compositions, not to be perfect. Whenever the program can't
+confidently say what the material is, it says nothing rather than guessing.
 
-It can also optionally take a second CSV from the **legacy ERP** with two
-columns: a part number and the material that part was recorded as in the
-legacy system.
-
-For each row, the program decides whether the **Material Composition** value
-in NetSuite is suspect, and if so, what it should probably be changed to.
-
-> **The focus of this version is correcting Material Composition.**
-> Class is treated as supporting evidence — never as a fix target. If the
-> class names a material that disagrees with the composition, the
-> recommendation is to update the composition (not reclassify the item).
+> **Scope:** this version only tries to correct **Material Composition**.
+> If the Class on an item disagrees with the composition, the program
+> recommends fixing the composition — never reclassifying the item.
 
 ---
 
-## 2. The evidence ranking
+## 2. The three pieces of evidence
 
-The program uses three sources of evidence to decide whether a Material
-Composition value is right or wrong. They are ranked by reliability — when
-two sources disagree, the higher-priority one wins:
+For each item, the program looks at up to three sources:
 
-| Tier | Source | Notes |
+| Tier | Source | Reliability |
 |---|---|---|
-| **1 (highest)** | **Name** — suffix or pattern in the part name | Most authoritative. -SS, -B, -D, "ALUM", "BR", "316", "S/S", standalone S, etc. |
-| **2 (middle)** | **Legacy ERP material** | An external authoritative source. Can occasionally be wrong, so name still wins. |
-| **3 (lowest)** | **Class** | Often wrong. Used as a hint only — never overrides name or legacy. |
+| **1 — Highest** | **Name** — recognized patterns inside the part number | Most authoritative. If a strict pattern matches, the program trusts it. |
+| **2 — Middle** | **Legacy ERP material** — looked up in a second optional CSV | Usually right. Occasionally wrong. |
+| **3 — Lowest** | **Class** — the NetSuite class string | Often wrong. Treated only as a weak hint. |
 
-This ranking has two consequences:
+Two rules govern how the tiers interact:
 
-1. **A higher-tier confirmation suppresses lower-tier disagreement flags.**
-   If the name's suffix says "Brass" and the composition is also Brass, the
-   program won't flag the row even if the class says Steel and the legacy
-   says Aluminum — the name is the most reliable signal and it confirms
-   the composition.
-2. **The Recommended Material always reflects the highest-tier signal in
-   play.** If the name says X, recommendation is X. If only legacy disagrees,
-   recommendation is the legacy value. If only the class names a different
-   material, recommendation is the class-named material.
+1. **Higher tier wins ties and conflicts.** If the Name pattern says Brass
+   and the Class says Stainless, the program goes with Brass. It never lets
+   a Class disagreement override a Name signal.
+2. **A higher-tier confirmation silences a lower-tier disagreement.** If
+   the Name says the composition is right, the program won't flag the row
+   just because the Legacy ERP disagrees — it assumes the legacy record is
+   the one that's outdated.
 
 ---
 
-## 3. Input requirements
+## 3. How a Name signal is recognized (the strict rules)
 
-### Required NetSuite CSV columns
-| Column | Used for |
-|---|---|
-| Name (or "Item Name") | Suffix detection, part-number lookup against legacy |
-| Class (or "Item Class") | Classification evidence (Tier 3) |
-| Material Composition | The field being audited |
+The program splits the part number on dashes. Example:
+`0306-08-SS-LW` → segments `0306`, `08`, `SS`, `LW`.
 
-### Optional NetSuite columns
-| Column | Used for |
-|---|---|
-| Internal ID | Detecting matrix parents (same ID on multiple rows) |
-| External ID | Primary key for legacy ERP lookup |
+It then looks **only at the last 3 segments** of the name. Material
+indicators that appear earlier than the last 3 segments are ignored. (A
+"STEEL" word at the front of a long name is not treated as a material
+signal — materials appear near the end of part numbers, not the start.)
 
-### Optional legacy ERP CSV columns
-| Column | Aliases accepted | Used for |
+Inside those last 3 segments, only these strict patterns count:
+
+| Pattern | Means | Notes |
 |---|---|---|
-| Part Number | "Part #", "PartNum", "Item Number" | Cross-check identifier |
-| Material | "Material Composition" | Authoritative comparison value |
+| A segment exactly equal to `SS` | **Stainless Steel** | Must be the whole segment, between dashes. `SS-LW` qualifies; `HNBR` does not. |
+| The **last** segment is exactly `B` | **Brass** | Must be the whole final segment. `HNBR`, `30B`, `-BR`, `-BB` do **not** count. |
+| A segment exactly equal to `D` | **Aluminum** | Whole segment only. |
+| A segment exactly equal to `ZN` | **Steel** (zinc plated base) | Whole segment only. |
+| The word `alum` appearing in the last 3 segments | **Aluminum** | Word match — catches `ALUM`, `ALUMINUM`, `ALUMINIUM`. |
+| The word `steel` (whole word) in the last 3 segments | **Steel** | Whole-word match. |
 
-Column names are matched case-insensitively and whitespace is trimmed.
-Common placeholder text — `TBD`, `N/A`, `Unknown`, `?`, `—` — is treated as
-blank in both files.
+That is the **complete** list. The program does **not** treat any of the
+following as a material signal anymore: `BR`, `BRS`, `BRASS` text, `316`,
+`304`, `S/S`, a lone `S`, `aerospace`. These caused false positives in
+earlier versions and were removed.
+
+If more than one pattern matches in the same name, priority is:
+`SS` → `-B` → `D` → `ZN` → `alum` keyword → `steel` keyword.
+
+If nothing matches, the Name simply has no signal — that's normal, and not
+itself a flag.
 
 ---
 
-## 4. The four rules
+## 4. How the Legacy ERP cross-check works
 
-The analyzer fires a flag (and a row gets marked **Has Issue = YES**) only
-when there is **positive evidence** that the Material Composition is wrong.
-Absence of evidence — e.g., a Brass part that doesn't have `-B` in its
-name — is not flagged. Many parts use legitimate alternate naming
-conventions.
+The legacy ERP cross-check is optional. If you provide a second CSV with
+two columns — a **part number** column and a **material** column — the
+program looks each NetSuite row up in it.
 
-### Rule 1 — Name implies a different material (Tier 1)
-**Fires when:** the part name has a recognized suffix or pattern AND the
-material that name implies disagrees with the current composition.
+- It matches first by **External ID**, then by **Name**.
+- Placeholder text like `TBD`, `N/A`, `Unknown`, `?`, `—`, `-` is treated as
+  blank.
+- If the same part appears more than once in the legacy file with conflicting
+  materials, the **first occurrence wins** — the program won't silently pick
+  a "newer" one.
 
-**Recognized signals (in priority order):**
+The looked-up value is shown in the **Legacy ERP Material** column.
 
-| Signal | Means | Examples |
-|---|---|---|
-| `SS` segment | Stainless Steel | `0306-08-SS`, `2106-04-SS-LW` |
-| Last segment exactly `B` | Brass | `0306-08-B` (NOT `-BB`, which is Brennan Black) |
-| `D` segment | Aluminum | `0306-08-D`, `0318-08-D-GREEN` |
-| `\bbrass\b`, `\bbrs\b`, `\bbr\b`, name ending in `BR`, digit+B at end | Brass | `200-24BR`, `202-30B` |
-| `\bSS\b`, `\bS/S\b`, `316`, `316L`, `304`, `304L`, `\bstainless\b`, standalone `S` | Stainless Steel | `2-S`, `2/1T MSA 316`, `200-05 316 S/S` |
-| `\balum` | Aluminum | `ALUM VENT 3 FPT` |
-| `\bsteel\b` | Steel | `STEEL TUBE 06` |
+---
 
-**Example flagged:** `2106-12-12-B` with composition `Stainless Steel`. The
-`-B` suffix says Brass; that disagrees with the composition. Even though
-the class might say "Stainless", **the name overrides the class** —
-flagged. Recommendation: Brass.
+## 5. How the Class signal works
 
-**Example NOT flagged:** `200-24BR` with composition `Brass`. The "BR"
-pattern matches — the name confirms the composition. No flag.
+The program scans the Class string for these whole keywords:
 
-### Rule 2 — Legacy ERP disagrees (Tier 2)
-**Fires when:** the legacy ERP has an entry for this part (matched by
-External ID first, then Name) AND the legacy material differs from the
-current composition AND the **name doesn't already confirm the composition**.
+- **stainless** → class names Stainless Steel
+- **steel** (without "stainless") → class names Steel
+- **brass** → class names Brass
+- **alumin** (matches Aluminum or Aluminium) → class names Aluminum
 
-**Why suppressed by name:** if the suffix/pattern says the composition is
-right, we trust that more than the legacy entry — legacy can occasionally
-be wrong. The legacy disagreement is treated as a stale legacy record,
-not a NetSuite problem.
+Priority is Stainless → Steel → Brass → Aluminum (a class containing
+"stainless steel" resolves to Stainless Steel, not Steel).
 
-**Example flagged:** legacy says `Brass`, NetSuite has `Steel`, name has
-no relevant suffix. Flagged. Recommendation: Brass (from legacy).
+The word **aerospace** is shown in the **Matched Signal** column as an
+informational note, but it does **not** confirm Aluminum any more —
+aerospace fittings can be Aluminum, Titanium, Steel, or other alloys.
 
-**Example NOT flagged:** name `0306-08-SS`, NetSuite composition
-`Stainless Steel`, legacy says `Steel`. The name's `-SS` confirms the
-NetSuite composition — the legacy entry is the odd one out. No flag.
+A class with **no** material keyword (e.g. `Hydraulic Fittings - 4-Bolt
+Flange`) provides no Class signal at all, and the program won't fire a
+Class flag on those rows.
 
-### Rule 3 — Class names a different specific material (Tier 3)
-**Fires when:** the Class string contains a recognized material keyword
-(`stainless`, `steel`, `brass`, `aluminum`, `aluminium`, `aerospace`)
-naming a material that disagrees with the composition AND **neither the
-name nor the legacy already confirms the composition**.
+**Brennan Black parts are exempt from the Class check.** A part is
+Brennan Black if `BB` appears as a whole segment in the name, **or** if
+the class contains "Brennan Black". `BB` is a program designation, not
+a material, and the class on those parts won't (and shouldn't) contain
+the material word.
 
-**Why this is the lowest priority:** class is the least reliable source.
-If the name or legacy already confirms the composition, a class
-disagreement is treated as a misclassification of the item — not a
-composition problem.
+---
 
-**Example flagged:** class `Hydraulic Fittings - Steel - LV`, composition
-`Brass`, no name signal, no legacy entry. Flagged. Recommendation: Steel
-(from class).
+## 6. The five things the program flags as issues
 
-**Example NOT flagged:** class `Hydraulic Fittings - 4-Bolt Flange -
-Split Flange`, composition `Brass`. The class is generic — it doesn't
-name a specific material — so it offers no evidence the composition is
-wrong. No flag.
+A row is marked **Has Issue = YES** if any of these fire. The program only
+flags when it has *positive* evidence something is wrong — a Brass part
+without `-B` in the name is **not** flagged just because the name doesn't
+say Brass.
 
-> "Aerospace" in a class is treated as Aluminum-confirming.
+### Issue 1 — Name Mismatch
+**Fires when:** the Name has one of the strict signals from §3, **and** that
+signal disagrees with the current Material Composition.
 
-### Rule 4 — Material Composition is empty
+> Example — `2106-12-12-B`, composition `Stainless Steel`, class
+> `Tube Fittings - Stainless`. The `-B` last segment says Brass. The
+> composition says Stainless. They disagree, so the row is flagged.
+> Recommendation: Brass. (Class says Stainless, but Name beats Class.)
+
+### Issue 2 — Legacy ERP Mismatch
+**Fires when:** the legacy ERP has an entry for this part, **and** that
+entry disagrees with the current Material Composition, **and** the Name
+signal hasn't already confirmed the composition is right.
+
+> Example — name `1234-FOO` (no recognized signal), composition `Steel`,
+> legacy says `Brass`. Flagged. Recommendation: Brass.
+
+> Example NOT flagged — name `FANCY-SS`, composition `Stainless Steel`,
+> legacy says `Steel`. The Name's `-SS` confirms the composition, so the
+> legacy disagreement is treated as a stale legacy record and silenced.
+
+### Issue 3 — Name ↔ Legacy Conflict
+**Fires when:** the Name has a recognized signal **and** the legacy ERP
+has an entry, **and** those two disagree.
+
+This fires even when one of them matches the current composition — because
+one of the two trusted sources is wrong, and a human should look.
+
+> Example — name `9999-SS`, legacy says `Brass`, composition `Stainless
+> Steel`. The Name says Stainless, the legacy says Brass. Flagged for
+> review. (The Name still wins for the recommendation: Stainless Steel.)
+
+### Issue 4 — Class Mismatch
+**Fires when:** the Class string names a specific material (Stainless,
+Steel, Brass, or Aluminum) **and** that material differs from the current
+composition, **and** neither the Name nor the Legacy ERP has already
+confirmed the composition is right.
+
+This is the **weakest** flag. Class is the least reliable source, so it's
+checked last and silenced first.
+
+> Example — name has no relevant pattern, no legacy entry, class is
+> `Hydraulic Fittings - Steel - LV`, composition is `Brass`. Flagged.
+> Recommendation: Steel.
+
+> Example NOT flagged — same situation but the legacy ERP says `Brass`.
+> Legacy confirms the composition, so the Class disagreement is silenced.
+
+### Issue 5 — Missing Composition
 **Fires when:** the Material Composition field is blank (after sentinel
-cleanup — so `TBD`, `N/A`, etc. count as blank).
-
-If a legacy ERP entry exists for this part, the suggested fix tells you
-to use that value. Otherwise, the recommendation defaults to whatever the
-class names, or "Steel" as a last resort.
+cleanup — `TBD`, `N/A`, etc. count as blank).
 
 ---
 
-## 5. What does NOT get flagged
+## 7. Three things the program notes but does NOT flag as issues
 
-Intentionally, by design:
+These appear in their own columns for context, but they do not count as
+issues and don't turn `Has Issue` to YES on their own:
 
-- **Brass composition with no `-B` in the name** and a generic or empty
-  class. Many parts legitimately use alternate naming conventions without
-  the material suffix.
-- **Stainless Steel composition with no `-SS`** and no contradicting class.
-- **Aluminum composition with no `-D`** and no contradicting class.
-- **Generic class** (e.g. `Hydraulic Fittings - 4-Bolt Flange`) with any
-  composition. No material is named, so the class can't disagree.
-- **Brennan Black parts** (`-BB` segment in the name OR class is "Brennan
-  Black"). Exempt from the class check by design — `-BB` is a program
-  designation, not a material.
-
----
-
-## 6. The Recommended Material column
-
-Every row gets a **Recommended Material** value. Priority (highest →
-lowest):
-
-1. **Name-implied material** — when Rule 1 fires
-2. **Legacy ERP material** — when Rule 2 fires
-3. **Class-named material** — when Rule 3 fires
-4. **Current Material Composition** — the default; trust what's there
-5. **Class-named or legacy material** — when composition is empty
-6. **"Steel"** — last-resort default when composition is empty AND no
-   other source provides a material
-
-If the row is **Has Issue = NO**, the Recommended Material always equals
-the current composition. The program never silently suggests a change on
-rows it considers correct.
+- **Matrix Parent** — the same Internal ID appears on more than one row
+  (the parent of a matrix item).
+- **BB Part (Exempt)** — `BB` segment or "Brennan Black" in the class.
+  Exempt from the Class check.
+- **Unknown Composition** — the composition is filled in but isn't one
+  of the recognized materials (Stainless Steel, Steel, Brass, Aluminum /
+  Aluminium / Aluminum Alloy). The program could only do limited
+  validation on these.
 
 ---
 
-## 7. The Suggested Fix column
+## 8. The Recommended Material column
 
-A short, templated sentence. Picked in priority order from whichever
-flag fires:
+Every row gets a value. It is picked like this:
 
-| Flag | Suggested Fix |
+1. **If no flag fired**, the recommendation equals the current composition.
+   The program never silently suggests changing a row it considers correct.
+2. **If the composition is blank**, an estimate is built from whatever
+   evidence exists, in this priority: Name signal → Legacy ERP → Class.
+   **If none of those have a signal, the recommendation is left BLANK.**
+   The program is willing to say "I don't know" rather than guess "Steel".
+3. **If the composition is filled in but a flag fired**, the recommendation
+   is the higher-tier signal that disagreed: Name beats Legacy beats Class.
+
+---
+
+## 9. The Confidence column
+
+When the program recommends a change, it scores how strong the evidence is:
+
+| Confidence | Meaning |
 |---|---|
-| Name implies different material | "Name suggests material is 'X' — verify and update Material Composition to 'X'" |
+| **High** | A literal suffix (`-SS`, `-B`, `-D`, `-ZN`) supports the recommendation, **OR** two or more independent sources (Name, Legacy, Class) agree on it. |
+| **Medium** | Either the Legacy ERP is the only supporting source, **OR** a keyword Name signal (`alum`/`steel`) stands alone, **OR** the High case was downgraded because the Name and Legacy disagreed. |
+| **Low** | The Class is the only source supporting the recommendation. |
+| **blank** | Row has no issue, or the row has an issue but no evidence was strong enough to make a recommendation. |
+
+A practical workflow: **filter Confidence = High first.** Those are the
+recommendations the program is most sure about, and the bulk corrections
+you do there cost the least review time. Then work down to Medium and Low.
+
+---
+
+## 10. The Matched Signal column
+
+For every row, this column lists which signals fired and what they said.
+It's the transparency column — if you don't believe a flag, look here
+first. Format:
+
+`name: <name signal> | legacy: <legacy material> | class: <class material>`
+
+Any of the three parts is omitted when that source had nothing to say. A
+row with no signals shows `—`.
+
+> Example: `name: -SS segment | legacy: Steel | class: Stainless Steel`
+> tells you the Name pattern was the literal `-SS` segment, the legacy ERP
+> said Steel, and the Class string contained "stainless". You can now
+> judge the flag yourself.
+
+---
+
+## 11. The Suggested Fix column
+
+A short, templated sentence per row, picked in priority order:
+
+| When this fires | Suggested Fix says |
+|---|---|
 | Legacy ERP disagrees | "Legacy ERP says 'X' — verify and update Material Composition to match (or correct legacy if NetSuite is right)" |
-| Empty composition + legacy match | "Set Material Composition to legacy ERP value: 'X'" |
+| Name ↔ Legacy Conflict | "Name says 'X' but Legacy ERP says 'Y' — investigate which source is correct before changing composition" |
+| Missing composition, no signal at all | "Material Composition is blank and no name/legacy/class signal — manual review needed" |
+| Missing composition, only Class names a material | "Material Composition is blank; class indicates 'X' — verify and set to this value" |
+| Missing composition, Legacy has a value | "Material Composition is blank; legacy ERP says 'X' — set to this value" |
+| Missing composition, Name signal present | "Material Composition is blank; name suggests 'X' — verify and set to this value" |
+| Name signal disagrees with composition | "Name suggests material is 'X' — verify and update Material Composition to 'X'" |
 | Class names different material | "Class indicates 'X' — verify and update Material Composition to 'X'" |
-| Empty composition (no legacy) | "Populate the Material Composition field" |
+| Missing composition (fallback) | "Populate the Material Composition field" |
 | No issue | "—" |
 
 ---
 
-## 8. Output workbook
+## 12. Output workbook
 
 ### Summary tab
-- Total records, records with issues, clean count, issue rate
-- Legacy ERP match coverage (when a legacy file was loaded)
-- Issue Breakdown — count per flag type. **A single row may be counted in
-  multiple lines** (a row can have both a name mismatch AND a class mismatch).
+- Total rows, rows with issues, clean count, issue rate
+- Legacy ERP match coverage (when a legacy file was used)
+- Issue breakdown by flag. A single row can be counted in multiple lines
+  if it triggered more than one flag.
 
 ### Detail tab
 - All source columns from the input CSV
-- **Legacy ERP Material** — what the legacy file said for this part
-- **Recommended Material** — what the composition should be (or keep)
-- **Suffix-Detected Material** — what the name implies, if anything
-- **Suggested Fix** — actionable guidance
-- **Analysis Notes** — explanation of any flags
+- **Legacy ERP Material** — what the legacy file said
+- **Recommended Material** — what the composition should be
+- **Suffix-Detected Material** — what the Name signal implied, if anything
+- **Matched Signal** — which signals fired (see §10)
+- **Confidence** — High / Medium / Low (see §9)
+- **Suggested Fix** — actionable guidance (see §11)
+- **Analysis Notes** — human-readable explanation of any flags
 - One column per flag (YES / —)
 - **Has Issue** — overall flag status
 
-The Detail tab has Excel autofilter enabled. Filter on **Has Issue = YES**
-to see only flagged rows, or filter individual flag columns for one
-issue type.
+Flagged rows are highlighted red. YES cells in flag columns are bold red.
+Excel autofilter is enabled on every data sheet.
+
+There is also a **Flagged Items** sheet (only the rows with `Has Issue = YES`),
+and one sheet per flag type that fired (skipped if a single type would
+exceed 20,000 rows).
 
 ---
 
-## 9. Sanity guards built in
+## 13. Safety guards built in
 
-- **Encoding fallback** — utf-8-sig (handles Excel BOM) → latin-1
-- **Whitespace-tolerant** column matching and value comparison
-- **Sentinel cleanup** — `TBD`, `N/A`, `Unknown`, `?`, `—`, `-` → blank
-- **Case-insensitive** material comparisons
-- **`-BB` is not `-B`** — exact segment matching, no partial collisions
-- **"Steel" class doesn't satisfy "Stainless Steel"** — separate keyword
-  logic
-- **Multi-composition rows** (matrix parents with comma/semicolon-
-  separated values) — each composition checked independently
-- **Duplicate Internal IDs** — flagged as matrix parents (informational
-  only)
-- **First-occurrence wins** in the legacy lookup when a part appears
-  multiple times — surfaced as a count of conflicts but not silently
-  overwritten
-- **NaN/Inf** in any column → blank before writing Excel
+- Encoding fallback: utf-8-sig (handles Excel BOM) → latin-1
+- Whitespace-tolerant column matching and value comparison
+- Sentinel cleanup: `TBD`, `N/A`, `Unknown`, `?`, `—`, `-` → treated as blank
+- All material comparisons are case-insensitive
+- `-BB` is **not** `-B` — segment matching is exact
+- `-B` must be the **last** segment — `-B-LW` does not qualify
+- A class containing "steel" does not satisfy a "stainless steel" composition
+- Multi-value compositions (comma/semicolon/pipe/newline separated) are each
+  checked independently
+- Duplicate Internal IDs are flagged as matrix parents (informational only)
+- First-occurrence wins in the legacy lookup on duplicate keys
+- NaN / ±Inf values in any column are blanked before writing Excel
 
 ---
 
-## 10. Worked examples
+## 14. Worked examples
 
-### Example A — `-B` suffix, but composition and class both say Stainless Steel
+### Example A — `-B` suffix, composition and class both say Stainless
 **Input:** name `2106-12-12-B`, class `Tube Fittings - Stainless - LV`,
-composition `Stainless Steel`.
+composition `Stainless Steel`, no legacy entry.
 
-**Logic:**
-- The `-B` suffix says Brass — name (Tier 1) implies Brass.
-- Name disagrees with composition → **Rule 1 fires**.
-- Class confirms composition (Stainless), but class is Tier 3 — it
-  cannot suppress a Tier 1 disagreement.
+- Name signal: `-B` last segment → Brass.
+- Legacy: none.
+- Class signal: Stainless Steel.
+- Name (Tier 1) disagrees with composition → **Name Mismatch fires.**
+- Class confirms composition but is Tier 3 — cannot silence Tier 1.
 
-**Result:** Has Issue = YES. Recommendation: Brass. Suggested Fix: "Name
-suggests material is 'Brass' — verify and update Material Composition to
-'Brass'".
+**Result:** Has Issue = YES. Recommendation: **Brass**. Confidence: **High**
+(literal `-B` suffix supports it). Suggested Fix: "Name suggests material is
+'Brass' — verify and update Material Composition to 'Brass'".
 
-### Example B — Brass part with no suffix and a generic class
+### Example B — Brass part with no `-B` and a generic class
 **Input:** name `1961-SHAFT`, class blank, composition `Brass`.
 
-**Logic:**
-- No name signal (no SS/B/D suffix, no BR/BRASS pattern)
-- No class signal
-- No legacy entry
-- All four rules check for *positive evidence*; none find any
+- No Name signal (no SS / B / D / ZN segments; no `alum` or `steel` word).
+- No legacy entry.
+- No Class signal.
 
-**Result:** Has Issue = NO. Recommendation: Brass.
+**Result:** Has Issue = NO. Recommendation: Brass. (The program does not
+flag the *absence* of a Name signal.)
 
-### Example C — Class names a material when nothing else helps
+### Example C — Class is the only signal
 **Input:** name `0306-09-LP`, class `Hydraulic Fittings - Steel - LV`,
-composition `Brass`.
+composition `Brass`, no legacy entry.
 
-**Logic:**
-- Name has no relevant suffix
-- No legacy entry
-- Class explicitly names "Steel" → Tier 3
-- Class disagrees with composition; nothing higher-tier confirms → **Rule 3
-  fires**
+- No Name signal.
+- No legacy entry.
+- Class names Steel, disagrees with composition → **Class Mismatch fires.**
 
-**Result:** Has Issue = YES. Recommendation: Steel.
+**Result:** Has Issue = YES. Recommendation: **Steel**. Confidence: **Low**
+(Class is the only supporting source).
 
-### Example D — Legacy disagrees but name confirms composition
+### Example D — Legacy disagrees but Name confirms composition
 **Input:** name `FANCY-SS`, composition `Stainless Steel`, legacy says `Steel`.
 
-**Logic:**
-- Name `-SS` confirms the composition (Tier 1)
-- Legacy disagrees but is Tier 2 — suppressed by Tier 1 confirmation
+- Name signal: `-SS` → Stainless Steel. Confirms composition.
+- Legacy disagrees, but legacy is Tier 2 — silenced by Tier 1 confirmation.
 
 **Result:** Has Issue = NO. Recommendation: Stainless Steel.
-(Implicitly: the legacy record is the wrong one, but we don't fix that
-from this tool.)
 
-### Example E — Three-way disagreement: legacy + class against composition
-**Input:** name has no relevant suffix, composition `Stainless Steel`,
+### Example E — Three-way disagreement, Name signal absent
+**Input:** name has no recognized pattern, composition `Stainless Steel`,
 legacy says `Brass`, class names `Steel`.
 
-**Logic:**
-- No Tier 1 signal
-- Legacy disagrees → **Rule 2 fires**
-- Class also disagrees, but Rule 3 is suppressed by legacy (Tier 2 > Tier 3)
+- No Name signal.
+- Legacy disagrees with composition → **Legacy ERP Mismatch fires.**
+- Class also disagrees, but Class is silenced because Legacy already fired
+  (we have a higher-tier explanation; we don't need a duplicate).
 
-**Result:** Has Issue = YES. Recommendation: Brass (legacy wins over class).
-Notes call out both disagreements so the human can sort it out.
+**Result:** Has Issue = YES. Recommendation: **Brass** (Legacy beats Class).
+Confidence: **Medium** (Legacy alone).
+
+### Example F — Name and Legacy disagree
+**Input:** name `9999-SS`, composition `Stainless Steel`, legacy says `Brass`.
+
+- Name signal: `-SS` → Stainless Steel. Confirms composition.
+- Legacy says Brass. Not silenced by Name → wait, actually it is —
+  Legacy Mismatch is silenced because Name confirms composition.
+- But the Name and Legacy disagree with **each other** →
+  **Name ↔ Legacy Conflict fires.**
+
+**Result:** Has Issue = YES. Recommendation: Stainless Steel (Name wins).
+Confidence: **Medium** (would be High for the literal suffix, but the
+Name↔Legacy conflict downgrades it). Suggested Fix tells the human to
+investigate which of the two trusted sources is wrong.
+
+### Example G — `-ZN` zinc-plated part
+**Input:** name `0306-08-ZN`, composition `Stainless Steel`, no legacy.
+
+- Name signal: `-ZN` → Steel (zinc-plated parts have a steel base).
+- Name disagrees with composition → **Name Mismatch fires.**
+
+**Result:** Has Issue = YES. Recommendation: **Steel**. Confidence: **High**
+(literal suffix).
+
+### Example H — Blank composition with no evidence anywhere
+**Input:** name `1961-SHAFT`, class blank, composition blank, no legacy.
+
+- No signal of any kind.
+- **Missing Composition fires** (because composition is blank).
+- No source can supply an estimate.
+
+**Result:** Has Issue = YES. Recommendation: **(blank)**. Confidence:
+**(blank)**. Suggested Fix: "Material Composition is blank and no
+name/legacy/class signal — manual review needed".
+
+### Example I — Blank composition, Name signal supplies the estimate
+**Input:** name `0306-08-SS`, composition blank, no legacy.
+
+- Name signal: `-SS` → Stainless Steel.
+- **Missing Composition fires.**
+- Estimate built from Name signal.
+
+**Result:** Has Issue = YES. Recommendation: **Stainless Steel**.
+Confidence: **High** (literal suffix). Suggested Fix: "Material Composition
+is blank; name suggests 'Stainless Steel' — verify and set to this value".
 
 ---
 
-## 11. Workflow tips
+## 15. Workflow tips
 
 1. **Run with all checks enabled first** to get the overall picture.
-2. **Use the autofilter** on the Detail tab to focus on one flag type at
-   a time. Name-mismatch issues are usually the easiest to fix in bulk.
-3. **Treat the Suggested Fix column as a hypothesis**, not a command. The
-   program is right most of the time, but always sanity-check before
-   making changes in NetSuite.
-4. **Re-run after each round of corrections** to confirm the issue count
+2. **Sort or filter by Confidence = High** — those are the safest bulk
+   corrections.
+3. **When in doubt, read the Matched Signal column.** It tells you exactly
+   why the program made its recommendation, in plain text.
+4. **Treat every Suggested Fix as a hypothesis** rather than a command.
+   Sanity-check before changing anything in NetSuite.
+5. **Re-run after each round of corrections** to confirm the issue count
    is going down.
-5. **Use the legacy ERP cross-check** when you have it. It's a strong
-   second-tier signal and dramatically reduces false positives on
-   raw-material-style part numbers that the name patterns can't classify.
+6. **Use the legacy ERP cross-check whenever you have it.** It dramatically
+   improves coverage on parts whose names don't follow the strict signal
+   conventions.
+7. **Don't expect zero false positives.** The program is calibrated to be
+   helpful to a human reviewer, not to be a robot that can finalize
+   changes unattended.

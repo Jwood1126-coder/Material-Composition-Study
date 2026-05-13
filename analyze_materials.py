@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 try:
     import xlsxwriter
@@ -114,6 +114,8 @@ ISSUE_FLAGS: dict[str, str] = {
     "flag_suffix_mismatch":            "Name Suffix ↔ Material Mismatch",
     "flag_legacy_disagrees":           "Legacy ERP Disagrees with Material Composition",
     "flag_name_legacy_conflict":       "Name Signal and Legacy ERP Disagree (Review)",
+    "flag_catsy_disagrees":            "Catsy PIM Disagrees with Material Composition",
+    "flag_name_catsy_conflict":        "Name Signal and Catsy Disagree (Review)",
     "flag_class_material_mismatch":    "Class Names Different Material",
     "flag_empty_material_composition": "Missing Material Composition",
 }
@@ -331,11 +333,73 @@ def build_legacy_lookup(legacy_df: pd.DataFrame) -> dict[str, str]:
     return lookup
 
 
+# ── Catsy PIM Cross-Check ──────────────────────────────────────────────────────
+
+def build_catsy_lookup(catsy_df: pd.DataFrame) -> dict[str, str]:
+    """
+    Build a part-number → material lookup from a Catsy PIM CSV export.
+
+    Expected columns (case-insensitive, with common aliases):
+      - Items            ('item', 'sku', 'part number', 'part #')
+      - Primary Material ('material', 'material composition', 'primarymaterial')
+
+    Returns a dict mapping lowercased part numbers → cleaned material strings.
+    Blank entries and sentinel placeholders (TBD, N/A, ?, —) are skipped.
+    On duplicate part-number keys, the FIRST occurrence wins (same policy as
+    the legacy ERP lookup — surfaces conflicts via the row count rather than
+    silently overwriting).
+    """
+    if catsy_df is None or len(catsy_df) == 0:
+        return {}
+
+    cols = {c.strip().lower(): c for c in catsy_df.columns}
+    item_col = next(
+        (cols[k] for k in ("items", "item", "sku", "part number", "part #",
+                           "partnum", "part_number", "item number", "item #")
+         if k in cols),
+        None
+    )
+    mat_col = next(
+        (cols[k] for k in ("primary material", "primarymaterial",
+                           "primary_material", "material",
+                           "material composition", "material_composition")
+         if k in cols),
+        None
+    )
+    if not item_col or not mat_col:
+        raise ValueError(
+            f"Catsy CSV must have an 'Items' column and a 'Primary Material' "
+            f"column. Found columns: {list(catsy_df.columns)}"
+        )
+
+    pn  = catsy_df[item_col].fillna("").astype(str).str.strip()
+    mat = catsy_df[mat_col].fillna("").astype(str).str.strip()
+
+    lookup: dict[str, str] = {}
+    for raw_p, raw_m in zip(pn, mat):
+        if raw_p in _LEGACY_SENTINELS or raw_m in _LEGACY_SENTINELS:
+            continue
+        if not raw_p or not raw_m:
+            continue
+        key = raw_p.lower()
+        if key in lookup:
+            continue        # first-occurrence wins
+        lookup[key] = raw_m
+
+    if not lookup:
+        raise ValueError(
+            "Catsy CSV produced 0 usable (Items, Primary Material) pairs — "
+            "every row was blank or a placeholder."
+        )
+    return lookup
+
+
 def analyze_dataframe(
     df: pd.DataFrame,
     enabled_checks: set[str] | None = None,
     progress_callback=None,
     legacy_lookup: dict[str, str] | None = None,
+    catsy_lookup: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """
     Vectorized analysis pipeline. ~10–50× faster than per-row iteration on
@@ -350,6 +414,12 @@ def analyze_dataframe(
                        When provided, each row is matched against External ID
                        first, then Name. Matches act as authoritative
                        confirmation; mismatches fire flag_legacy_disagrees.
+    catsy_lookup     : optional dict mapping lowercased part-number → material
+                       (built via build_catsy_lookup from a Catsy PIM CSV).
+                       Matched by Name (Catsy "Items" column = part number).
+                       Tier-2 equivalent to legacy_lookup — parallel cross-
+                       reference. Fires flag_catsy_disagrees on disagreements;
+                       used to fill blank NetSuite compositions too.
     """
     if enabled_checks is None:
         enabled_checks = set(ISSUE_FLAGS.keys())
@@ -440,6 +510,17 @@ def analyze_dataframe(
         legacy_mat = pd.Series([""] * n, index=idx, dtype=object)
     legacy_lower = legacy_mat.str.lower()
     has_legacy   = legacy_lower != ""
+
+    # ── Catsy PIM lookup ───────────────────────────────────────────────────
+    # Parallel cross-reference to Legacy ERP. Matched by Name only (Catsy's
+    # "Items" column is the part number, which corresponds to NetSuite Name).
+    if catsy_lookup:
+        name_lower_for_catsy = name.str.lower()
+        catsy_mat = name_lower_for_catsy.map(catsy_lookup).fillna("")
+    else:
+        catsy_mat = pd.Series([""] * n, index=idx, dtype=object)
+    catsy_lower = catsy_mat.str.lower()
+    has_catsy   = catsy_lower != ""
 
     report(0.10, "Parsing names…")
 
@@ -558,6 +639,7 @@ def analyze_dataframe(
         (expected_mat != "") & (matc_lower != "") & (expected_lower == matc_lower)
     )
     legacy_confirms_comp = has_legacy & (legacy_lower == matc_lower)
+    catsy_confirms_comp  = has_catsy  & (catsy_lower  == matc_lower)
 
     report(0.30, "Checking suffix rules…")
 
@@ -593,6 +675,19 @@ def analyze_dataframe(
         )
     else:
         flag_legacy_disagrees = pd.Series([False] * n, index=idx)
+
+    # ── FLAG: Catsy PIM disagrees (parallel to legacy, tier 2) ─────────────
+    # Fires when Catsy has a different material than NetSuite, UNLESS the
+    # name (tier 1) confirms the NetSuite composition is right. Legacy and
+    # Catsy are parallel — Catsy is NOT silenced by a legacy confirmation
+    # and vice versa, so genuine PIM/ERP disagreements stay visible.
+    if "flag_catsy_disagrees" in enabled_checks:
+        flag_catsy_disagrees = (
+            has_catsy & (matc_lower != "") & (catsy_lower != matc_lower)
+            & ~name_confirms_comp
+        )
+    else:
+        flag_catsy_disagrees = pd.Series([False] * n, index=idx)
 
     report(0.50, "Checking class consistency…")
 
@@ -638,6 +733,7 @@ def analyze_dataframe(
             & (class_material_named != "")
             & ~name_confirms_comp
             & ~legacy_confirms_comp
+            & ~catsy_confirms_comp
         )
 
         # Single-composition rows: simple inequality
@@ -685,9 +781,21 @@ def analyze_dataframe(
     else:
         flag_name_legacy_conflict = pd.Series([False] * n, index=idx)
 
+    # ── FLAG: name vs Catsy conflict ───────────────────────────────────────
+    # Same shape as name↔legacy. Two trusted signals disagreeing — worth a
+    # human's attention regardless of what the composition currently says.
+    name_catsy_conflict = (
+        name_signal_present & has_catsy & (expected_lower != catsy_lower)
+    )
+    if "flag_name_catsy_conflict" in enabled_checks:
+        flag_name_catsy_conflict = name_catsy_conflict
+    else:
+        flag_name_catsy_conflict = pd.Series([False] * n, index=idx)
+
     # any_flag = OR of all issue flags (positive evidence only).
     any_flag = (
         flag_suffix | flag_legacy_disagrees | flag_name_legacy_conflict
+        | flag_catsy_disagrees | flag_name_catsy_conflict
         | flag_class | flag_empty
     )
 
@@ -712,6 +820,8 @@ def analyze_dataframe(
     blank = (matc == "")
     blank_with_class = blank & (class_material_named != "")
     recommended_mat = recommended_mat.mask(blank_with_class, class_material_named)
+    blank_with_catsy = blank & has_catsy
+    recommended_mat = recommended_mat.mask(blank_with_catsy, catsy_mat)
     blank_with_legacy = blank & has_legacy
     recommended_mat = recommended_mat.mask(blank_with_legacy, legacy_mat)
     blank_with_name = blank & (expected_mat != "")
@@ -723,6 +833,7 @@ def analyze_dataframe(
     # but a higher-priority signal says it's wrong ──────────────────────
     # Apply in reverse priority order (last write wins).
     recommended_mat = recommended_mat.mask(flag_class, class_material_named)
+    recommended_mat = recommended_mat.mask(flag_catsy_disagrees, catsy_mat)
     recommended_mat = recommended_mat.mask(flag_legacy_disagrees, legacy_mat)
     recommended_mat = recommended_mat.mask(forward_mismatch, expected_mat)
 
@@ -774,6 +885,10 @@ def analyze_dataframe(
         matched_signal + SIGSEP + "legacy: " + legacy_mat
     )
     matched_signal = matched_signal.mask(
+        has_catsy,
+        matched_signal + SIGSEP + "catsy: " + catsy_mat
+    )
+    matched_signal = matched_signal.mask(
         class_signal_text != "",
         matched_signal + SIGSEP + "class: " + class_signal_text
     )
@@ -796,10 +911,12 @@ def analyze_dataframe(
     name_signal_present  = (expected_mat != "")
     name_supports_rec    = name_signal_present & (expected_lower == rec_lower)
     legacy_supports_rec  = has_legacy & (legacy_lower == rec_lower)
+    catsy_supports_rec   = has_catsy  & (catsy_lower  == rec_lower)
     class_supports_rec   = (class_material_named != "") & (class_material_named.str.lower() == rec_lower)
     n_supporting = (
         name_supports_rec.astype(int)
         + legacy_supports_rec.astype(int)
+        + catsy_supports_rec.astype(int)
         + class_supports_rec.astype(int)
     )
 
@@ -811,16 +928,22 @@ def analyze_dataframe(
     # Apply lowest → highest (last write wins).
     # LOW: class is the only supporting signal
     confidence = confidence.mask(
-        needs & class_supports_rec & ~legacy_supports_rec & ~name_supports_rec,
+        needs & class_supports_rec
+        & ~legacy_supports_rec & ~catsy_supports_rec & ~name_supports_rec,
         "Low"
     )
-    # MEDIUM: legacy alone OR keyword name alone
+    # MEDIUM: legacy alone, OR catsy alone, OR keyword name alone
     confidence = confidence.mask(
-        needs & legacy_supports_rec & ~name_supports_rec,
+        needs & legacy_supports_rec & ~name_supports_rec & ~catsy_supports_rec,
         "Medium"
     )
     confidence = confidence.mask(
-        needs & name_supports_rec & keyword_signal & ~literal_suffix_signal & ~legacy_supports_rec,
+        needs & catsy_supports_rec & ~name_supports_rec & ~legacy_supports_rec,
+        "Medium"
+    )
+    confidence = confidence.mask(
+        needs & name_supports_rec & keyword_signal & ~literal_suffix_signal
+        & ~legacy_supports_rec & ~catsy_supports_rec,
         "Medium"
     )
     # HIGH: literal suffix supporting, OR multiple sources agreeing
@@ -832,10 +955,10 @@ def analyze_dataframe(
         needs & (n_supporting >= 2),
         "High"
     )
-    # Conflict downgrade: when name signal and legacy ERP disagree on the
-    # material (one of them is wrong), confidence drops.
+    # Conflict downgrade: when the name signal disagrees with a tier-2
+    # source (legacy or catsy), one of them is wrong → confidence drops.
     confidence = confidence.mask(
-        needs & flag_name_legacy_conflict,
+        needs & (flag_name_legacy_conflict | flag_name_catsy_conflict),
         "Medium"
     )
 
@@ -871,6 +994,14 @@ def analyze_dataframe(
         )
         parts = parts.mask(flag_legacy_disagrees, parts + SEP + legacy_disagree_text)
 
+    # Catsy PIM disagreement note — parallel to legacy
+    if "flag_catsy_disagrees" in enabled_checks:
+        catsy_disagree_text = (
+            "Catsy says '" + catsy_mat
+            + "' but Material Composition is '" + matc + "'"
+        )
+        parts = parts.mask(flag_catsy_disagrees, parts + SEP + catsy_disagree_text)
+
     if "flag_suffix_mismatch" in enabled_checks:
         # Name (suffix or keyword) implies a different material than comp
         fwd_text = (
@@ -893,6 +1024,17 @@ def analyze_dataframe(
             parts + SEP + conflict_warning
         )
 
+    if "flag_name_catsy_conflict" in enabled_checks:
+        catsy_conflict_warning = (
+            "Name signal says '" + expected_mat
+            + "' but Catsy says '" + catsy_mat
+            + "' — investigate which is correct"
+        )
+        parts = parts.mask(
+            flag_name_catsy_conflict,
+            parts + SEP + catsy_conflict_warning
+        )
+
     if "flag_class_material_mismatch" in enabled_checks:
         parts = parts.mask(flag_class, parts + SEP + class_note_text)
 
@@ -905,28 +1047,40 @@ def analyze_dataframe(
     # ERP first (most authoritative), then suffix, class, matrix, empty, soft.
     fix = pd.Series([""] * n, index=idx, dtype=object)
 
-    # Legacy ERP disagrees — strongest signal, recommend the legacy value
+    # Legacy ERP disagrees — strong signal, recommend the legacy value
     fix = fix.mask(
         flag_legacy_disagrees,
         "Legacy ERP says '" + legacy_mat
         + "' — verify and update Material Composition to match (or correct legacy if NetSuite is right)"
     )
-    # Name vs Legacy conflict — when both signals are present but disagree
+    # Catsy PIM disagrees — parallel to legacy
+    fix = fix.mask(
+        flag_catsy_disagrees & (fix == ""),
+        "Catsy says '" + catsy_mat
+        + "' — verify and update Material Composition to match (or correct Catsy if NetSuite is right)"
+    )
+    # Name vs Legacy conflict — two trusted signals disagree with each other
     fix = fix.mask(
         flag_name_legacy_conflict & (fix == ""),
         "Name says '" + expected_mat + "' but Legacy ERP says '" + legacy_mat
         + "' — investigate which source is correct before changing composition"
     )
+    # Name vs Catsy conflict — same shape
+    fix = fix.mask(
+        flag_name_catsy_conflict & (fix == ""),
+        "Name says '" + expected_mat + "' but Catsy says '" + catsy_mat
+        + "' — investigate which source is correct before changing composition"
+    )
 
     # Composition empty — give an evidence-based estimate per priority:
-    # name signal > legacy > class > (no estimate)
+    # name > legacy > catsy > class > (no estimate)
     fix = fix.mask(
         flag_empty & no_estimate & (fix == ""),
-        "Material Composition is blank and no name/legacy/class signal — manual review needed"
+        "Material Composition is blank and no name/legacy/catsy/class signal — manual review needed"
     )
     fix = fix.mask(
-        flag_empty & blank_with_class & ~has_legacy & ~name_signal_present & (fix == ""),
-        "Material Composition is blank; class indicates '" + class_material_named
+        flag_empty & name_signal_present & (fix == ""),
+        "Material Composition is blank; name suggests '" + expected_mat
         + "' — verify and set to this value"
     )
     fix = fix.mask(
@@ -935,8 +1089,13 @@ def analyze_dataframe(
         + "' — set to this value"
     )
     fix = fix.mask(
-        flag_empty & name_signal_present & (fix == ""),
-        "Material Composition is blank; name suggests '" + expected_mat
+        flag_empty & has_catsy & ~name_signal_present & ~has_legacy & (fix == ""),
+        "Material Composition is blank; Catsy says '" + catsy_mat
+        + "' — set to this value"
+    )
+    fix = fix.mask(
+        flag_empty & blank_with_class & ~name_signal_present & ~has_legacy & ~has_catsy & (fix == ""),
+        "Material Composition is blank; class indicates '" + class_material_named
         + "' — verify and set to this value"
     )
 
@@ -969,12 +1128,15 @@ def analyze_dataframe(
     result["flag_suffix_mismatch"]            = flag_suffix.astype(bool)
     result["flag_legacy_disagrees"]           = flag_legacy_disagrees.astype(bool)
     result["flag_name_legacy_conflict"]       = flag_name_legacy_conflict.astype(bool)
+    result["flag_catsy_disagrees"]            = flag_catsy_disagrees.astype(bool)
+    result["flag_name_catsy_conflict"]        = flag_name_catsy_conflict.astype(bool)
     result["flag_class_material_mismatch"]    = flag_class.astype(bool)
     result["flag_empty_material_composition"] = flag_empty.astype(bool)
     result["flag_is_matrix_parent"]           = is_matrix_parent.astype(bool)
     result["flag_is_bb_part"]                 = is_bb_flag.astype(bool)
     result["flag_unknown_composition"]        = flag_unknown_composition.astype(bool)
     result["legacy_material"]                 = legacy_mat
+    result["catsy_material"]                  = catsy_mat
     result["recommended_material"]            = recommended_mat
     result["expected_material_from_name"]     = expected_mat
     result["matched_signal"]                  = matched_signal
@@ -1040,6 +1202,8 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "flag_suffix_mismatch":            "Name Mismatch",
     "flag_legacy_disagrees":           "Legacy ERP Mismatch",
     "flag_name_legacy_conflict":       "Name ↔ Legacy Conflict",
+    "flag_catsy_disagrees":            "Catsy PIM Mismatch",
+    "flag_name_catsy_conflict":        "Name ↔ Catsy Conflict",
     "flag_class_material_mismatch":    "Class Mismatch",
     "flag_empty_material_composition": "Missing Composition",
     "flag_is_matrix_parent":           "Matrix Parent",
@@ -1047,6 +1211,7 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "flag_unknown_composition":        "Unknown Composition",
     "any_flag":                        "Has Issue",
     "legacy_material":                 "Legacy ERP Material",
+    "catsy_material":                  "Catsy PIM Material",
     "recommended_material":            "Recommended Material",
     "expected_material_from_name":     "Suffix-Detected Material",
     "matched_signal":                  "Matched Signal",
@@ -1083,7 +1248,8 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
                 pass
 
     # ── Column ordering ────────────────────────────────────────────────────
-    derived_cols   = ["legacy_material", "recommended_material",
+    derived_cols   = ["legacy_material", "catsy_material",
+                      "recommended_material",
                       "expected_material_from_name", "matched_signal",
                       "confidence", "suggested_fix", "analysis_notes"]
     source_cols = [
@@ -1215,6 +1381,14 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
             summary_rows.append(
                 ("Legacy ERP Matches", f"{legacy_matches:,}  ({cov:.1f}%)")
             )
+    # Same for Catsy PIM cross-check
+    if "catsy_material" in df.columns:
+        catsy_matches = int((df["catsy_material"] != "").sum())
+        if catsy_matches > 0:
+            cov = catsy_matches / total * 100 if total else 0.0
+            summary_rows.append(
+                ("Catsy PIM Matches", f"{catsy_matches:,}  ({cov:.1f}%)")
+            )
     summary_rows += [
         ("", ""),
         ("Issue Breakdown (a single row may be counted in multiple lines)", "Count"),
@@ -1226,7 +1400,8 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
     # Start writing at row 3 (0-indexed), leaving row 2 as a spacer
     out_row = 3
     bold_keys = {"Total Records Analyzed", "Records with Issues",
-                 "Clean Records", "Issue Rate", "Legacy ERP Matches"}
+                 "Clean Records", "Issue Rate",
+                 "Legacy ERP Matches", "Catsy PIM Matches"}
     for label, value in summary_rows:
         if label.startswith("Issue Breakdown"):
             ws.write(out_row, 0, label, fmt["section"])
@@ -1272,7 +1447,8 @@ def _write_data_sheet_xlsx(ws, df: pd.DataFrame, fmt: dict, on_chunk_written) ->
             ws.set_column(col_idx, col_idx, 60, fmt["notes"])
         elif col_idx in flag_positions:
             ws.set_column(col_idx, col_idx, 16, fmt["center"])
-        elif c in ("recommended_material", "expected_material_from_name", "legacy_material"):
+        elif c in ("recommended_material", "expected_material_from_name",
+                   "legacy_material", "catsy_material"):
             ws.set_column(col_idx, col_idx, 26)
         elif c == "matched_signal":
             ws.set_column(col_idx, col_idx, 45, fmt["notes"])
@@ -1359,15 +1535,16 @@ Examples:
     p.add_argument(
         "--checks", "-c",
         nargs="+",
-        choices=["suffix", "class", "empty", "legacy", "all"],
+        choices=["suffix", "class", "empty", "legacy", "catsy", "all"],
         default=["all"],
         help=(
             "Which checks to run (default: all). "
             "'suffix' = name (suffix or pattern) ↔ material; "
             "'legacy' = legacy ERP cross-check (requires --legacy-csv); "
+            "'catsy'  = Catsy PIM cross-check (requires --catsy-csv); "
             "'class' = class names a different material; "
             "'empty' = missing composition. "
-            "Example: --checks suffix legacy"
+            "Example: --checks suffix legacy catsy"
         ),
     )
     p.add_argument(
@@ -1378,15 +1555,26 @@ Examples:
              "(falling back to Name) and the legacy material is used as an "
              "authoritative cross-check.",
     )
+    p.add_argument(
+        "--catsy-csv",
+        metavar="CATSY.csv",
+        help="Optional Catsy PIM CSV with 'Items' + 'Primary Material' columns. "
+             "Each NetSuite row is matched by Name; the Catsy material is used "
+             "as a parallel tier-2 cross-reference (alongside legacy ERP).",
+    )
     return p
 
 
-# Maps user-friendly check names → the underlying flag column.
-CHECK_NAME_TO_FLAG: dict[str, str] = {
-    "suffix": "flag_suffix_mismatch",
-    "class":  "flag_class_material_mismatch",
-    "empty":  "flag_empty_material_composition",
-    "legacy": "flag_legacy_disagrees",
+# Maps user-friendly check names → the set of underlying flag columns it
+# enables. Some check names (legacy, catsy) cover two related flags — the
+# main disagreement flag PLUS the name-vs-source conflict flag — because
+# users think of them as one check, not two.
+CHECK_NAME_TO_FLAG: dict[str, set[str]] = {
+    "suffix": {"flag_suffix_mismatch"},
+    "class":  {"flag_class_material_mismatch"},
+    "empty":  {"flag_empty_material_composition"},
+    "legacy": {"flag_legacy_disagrees", "flag_name_legacy_conflict"},
+    "catsy":  {"flag_catsy_disagrees",  "flag_name_catsy_conflict"},
 }
 
 
@@ -1394,7 +1582,11 @@ def resolve_checks(names: list[str]) -> set[str]:
     """Convert a list like ['suffix','class'] or ['all'] → set of flag column keys."""
     if not names or "all" in names:
         return set(ISSUE_FLAGS.keys())
-    return {CHECK_NAME_TO_FLAG[n] for n in names if n in CHECK_NAME_TO_FLAG}
+    out: set[str] = set()
+    for n in names:
+        if n in CHECK_NAME_TO_FLAG:
+            out |= CHECK_NAME_TO_FLAG[n]
+    return out
 
 
 def load_csv(path: Path, encoding: str) -> pd.DataFrame:
@@ -1433,11 +1625,26 @@ def run_cli(args) -> None:
             print(f"ERROR: {exc}")
             sys.exit(1)
 
+    catsy_lookup = None
+    if args.catsy_csv:
+        catsy_path = Path(args.catsy_csv)
+        if not catsy_path.exists():
+            print(f"ERROR: Catsy CSV not found: {catsy_path}")
+            sys.exit(1)
+        catsy_df = load_csv(catsy_path, args.encoding)
+        try:
+            catsy_lookup = build_catsy_lookup(catsy_df)
+            print(f"Loaded {len(catsy_lookup):,} Catsy PIM entries\n")
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+
     try:
         df_result = analyze_dataframe(
             df_raw,
             enabled_checks=resolve_checks(args.checks),
             legacy_lookup=legacy_lookup,
+            catsy_lookup=catsy_lookup,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}")
@@ -1474,10 +1681,26 @@ def run_gui() -> None:
 
     root = tk.Tk()
     root.title("Material Composition Analyzer")
-    root.geometry("680x760")
-    root.minsize(620, 700)
+    root.geometry("760x860")
+    root.minsize(680, 760)
 
-    state = {"csv_path": None, "xlsx_path": None, "legacy_path": None}
+    state = {
+        "csv_path": None, "xlsx_path": None,
+        "legacy_path": None, "catsy_path": None,
+    }
+
+    def truncate_filename(name: str, max_len: int = 56) -> str:
+        """Middle-ellipsis: 'long-filename-export.csv' → 'long-fi…rt.csv'.
+
+        Keeps a useful prefix + the suffix (including extension) visible so
+        the user can still recognize the file without the label getting clipped.
+        """
+        if len(name) <= max_len:
+            return name
+        keep = max_len - 1               # 1 char for the ellipsis
+        head = keep * 2 // 3
+        tail = keep - head
+        return f"{name[:head]}…{name[-tail:]}"
 
     # ── Layout ─────────────────────────────────────────────────────────────
     main_frame = ttk.Frame(root, padding=20)
@@ -1511,7 +1734,7 @@ def run_gui() -> None:
         )
         if path:
             state["csv_path"] = path
-            file_lbl.config(text=Path(path).name, foreground="#000000")
+            file_lbl.config(text=truncate_filename(Path(path).name), foreground="#000000")
             analyze_btn.config(state="normal")
             status_lbl.config(text="Ready to analyze.", foreground="#000000")
 
@@ -1540,7 +1763,7 @@ def run_gui() -> None:
         )
         if path:
             state["legacy_path"] = path
-            legacy_lbl.config(text=Path(path).name, foreground="#000000")
+            legacy_lbl.config(text=truncate_filename(Path(path).name), foreground="#000000")
 
     legacy_clear_btn = ttk.Button(legacy_frame, text="Clear", command=clear_legacy)
     legacy_clear_btn.pack(side="right", padx=(6, 0))
@@ -1549,6 +1772,37 @@ def run_gui() -> None:
     )
     legacy_pick_btn.pack(side="right", padx=(10, 0))
 
+    # ── Optional Catsy PIM cross-check ─────────────────────────────────────
+    catsy_frame = ttk.LabelFrame(
+        main_frame, text="Catsy PIM Cross-Check (optional)", padding=10
+    )
+    catsy_frame.pack(fill="x", pady=(8, 0))
+
+    catsy_lbl = ttk.Label(
+        catsy_frame, text="(no file selected)", foreground="#888888"
+    )
+    catsy_lbl.pack(side="left", fill="x", expand=True)
+
+    def clear_catsy():
+        state["catsy_path"] = None
+        catsy_lbl.config(text="(no file selected)", foreground="#888888")
+
+    def pick_catsy():
+        path = filedialog.askopenfilename(
+            title="Select Catsy CSV (Items + Primary Material columns)",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            state["catsy_path"] = path
+            catsy_lbl.config(text=truncate_filename(Path(path).name), foreground="#000000")
+
+    catsy_clear_btn = ttk.Button(catsy_frame, text="Clear", command=clear_catsy)
+    catsy_clear_btn.pack(side="right", padx=(6, 0))
+    catsy_pick_btn = ttk.Button(
+        catsy_frame, text="Choose Catsy CSV…", command=pick_catsy
+    )
+    catsy_pick_btn.pack(side="right", padx=(10, 0))
+
     # ── Checks scope ───────────────────────────────────────────────────────
     checks_frame = ttk.LabelFrame(main_frame, text="Checks to Run", padding=10)
     checks_frame.pack(fill="x", pady=(12, 0))
@@ -1556,14 +1810,14 @@ def run_gui() -> None:
     check_vars: dict[str, tk.BooleanVar] = {
         "suffix": tk.BooleanVar(value=True),
         "class":  tk.BooleanVar(value=True),
-        "matrix": tk.BooleanVar(value=True),
         "empty":  tk.BooleanVar(value=True),
+        "catsy":  tk.BooleanVar(value=True),
     }
     check_labels = {
         "suffix": "Name suffix ↔ material composition",
         "class":  "Class reflects material composition",
-        "matrix": "Matrix Material field matches composition",
         "empty":  "Missing material composition",
+        "catsy":  "Catsy PIM cross-check (needs Catsy CSV)",
     }
 
     for key, label in check_labels.items():
@@ -1580,13 +1834,16 @@ def run_gui() -> None:
             var.set(k in keys)
 
     ttk.Button(scope_btns, text="All",
-               command=lambda: set_scope("suffix", "class", "matrix", "empty"),
+               command=lambda: set_scope("suffix", "class", "empty", "catsy"),
                width=10).pack(side="left")
     ttk.Button(scope_btns, text="Suffix only",
                command=lambda: set_scope("suffix"),
                width=12).pack(side="left", padx=(6, 0))
     ttk.Button(scope_btns, text="Class only",
                command=lambda: set_scope("class"),
+               width=12).pack(side="left", padx=(6, 0))
+    ttk.Button(scope_btns, text="Catsy only",
+               command=lambda: set_scope("catsy"),
                width=12).pack(side="left", padx=(6, 0))
 
     # ── Layout: pack the action buttons to the BOTTOM first so they're
@@ -1616,7 +1873,7 @@ def run_gui() -> None:
 
     summary_text = tk.Text(
         status_frame,
-        height=8,
+        height=12,
         wrap="word",
         state="disabled",
         font=("Consolas", 10),
@@ -1636,16 +1893,68 @@ def run_gui() -> None:
         except Exception as exc:
             messagebox.showerror("Couldn't open", str(exc))
 
+    def with_loading_bar(message: str, action, duration_ms: int = 2500):
+        """Reuse the progress bar in indeterminate mode for OS-level launches.
+
+        The OS handles the actual work (opening Excel / a file manager) in
+        the background and we get no completion signal back. We just show
+        an animated bar for `duration_ms` so the user has visible feedback
+        that something is happening, then hide it again. Buttons that
+        trigger this are disabled for the same window to prevent runaway
+        double-clicks.
+        """
+        # Disable Open buttons during the launch window
+        open_file_btn.config(state="disabled")
+        open_folder_btn.config(state="disabled")
+
+        progress.config(mode="indeterminate", value=0)
+        progress_lbl.config(text=message)
+        progress_lbl.pack(side="bottom", fill="x")
+        progress.pack(side="bottom", fill="x", pady=(10, 4))
+        progress.start(15)        # ms per tick
+
+        # Kick off the OS-level action in a thread so the UI stays responsive
+        threading.Thread(target=action, daemon=True).start()
+
+        def cleanup():
+            progress.stop()
+            progress.config(mode="determinate", value=0)
+            progress.pack_forget()
+            progress_lbl.pack_forget()
+            # Re-enable Open buttons only if we still have a report
+            if state["xlsx_path"]:
+                open_file_btn.config(state="normal")
+                open_folder_btn.config(state="normal")
+        root.after(duration_ms, cleanup)
+
+    def do_open_excel():
+        if not state["xlsx_path"]:
+            return
+        with_loading_bar(
+            "Opening Excel report…",
+            lambda: open_path(state["xlsx_path"]),
+            duration_ms=2800,
+        )
+
+    def do_open_folder():
+        if not state["xlsx_path"]:
+            return
+        with_loading_bar(
+            "Opening folder…",
+            lambda: open_path(str(Path(state["xlsx_path"]).parent)),
+            duration_ms=1200,
+        )
+
     open_file_btn = ttk.Button(
         btn_frame,
         text="Open Excel Report",
-        command=lambda: open_path(state["xlsx_path"]) if state["xlsx_path"] else None,
+        command=do_open_excel,
         state="disabled",
     )
     open_folder_btn = ttk.Button(
         btn_frame,
         text="Open Folder",
-        command=lambda: open_path(str(Path(state["xlsx_path"]).parent)) if state["xlsx_path"] else None,
+        command=do_open_folder,
         state="disabled",
     )
 
@@ -1708,8 +2017,9 @@ def run_gui() -> None:
                 push_progress(start + span * local_pct, msg)
             return cb
 
-        # Snapshot legacy path at click time too
+        # Snapshot cross-reference paths at click time too
         legacy_path = state.get("legacy_path")
+        catsy_path  = state.get("catsy_path")
 
         def worker():
             try:
@@ -1726,8 +2036,20 @@ def run_gui() -> None:
                     legacy_df = load_csv(Path(legacy_path), "utf-8-sig")
                     legacy_lookup = build_legacy_lookup(legacy_df)
                     push_progress(
-                        0.06,
+                        0.055,
                         f"Legacy ERP: {len(legacy_lookup):,} entries loaded"
+                    )
+
+                # Load Catsy PIM lookup if a path was picked
+                catsy_lookup = None
+                catsy_match_count = 0
+                if catsy_path:
+                    push_progress(0.058, "Reading Catsy PIM CSV…")
+                    catsy_df = load_csv(Path(catsy_path), "utf-8-sig")
+                    catsy_lookup = build_catsy_lookup(catsy_df)
+                    push_progress(
+                        0.06,
+                        f"Catsy PIM: {len(catsy_lookup):,} entries loaded"
                     )
 
                 df_result = analyze_dataframe(
@@ -1735,10 +2057,13 @@ def run_gui() -> None:
                     enabled_checks=enabled,
                     progress_callback=make_phase_cb(0.06, 0.35),
                     legacy_lookup=legacy_lookup,
+                    catsy_lookup=catsy_lookup,
                 )
 
                 if legacy_lookup is not None:
                     legacy_match_count = int((df_result["legacy_material"] != "").sum())
+                if catsy_lookup is not None:
+                    catsy_match_count = int((df_result["catsy_material"] != "").sum())
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 xlsx_p = csv_p.with_name(
@@ -1763,6 +2088,12 @@ def run_gui() -> None:
                     pct_match = legacy_match_count / total * 100 if total else 0.0
                     lines.append(
                         f"Legacy match:   {legacy_match_count:,} of {total:,} "
+                        f"({pct_match:.1f}%)"
+                    )
+                if catsy_lookup is not None:
+                    pct_match = catsy_match_count / total * 100 if total else 0.0
+                    lines.append(
+                        f"Catsy match:    {catsy_match_count:,} of {total:,} "
                         f"({pct_match:.1f}%)"
                     )
                 lines += ["", "Issue breakdown:"]
