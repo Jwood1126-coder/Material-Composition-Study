@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.12.3"
+__version__ = "1.12.4"
 
 try:
     import xlsxwriter
@@ -512,6 +512,7 @@ def analyze_dataframe(
 
     # ── Legacy ERP lookup ──────────────────────────────────────────────────
     # Tried in order: External ID, full Name, matrix-child portion of Name.
+    # Also surfaces the key that actually matched (for audit transparency).
     if legacy_lookup:
         ext_lower  = ext_id.str.lower()
         legacy_via_ext   = ext_lower.map(legacy_lookup).fillna("")
@@ -519,8 +520,19 @@ def analyze_dataframe(
         legacy_via_child = name_child_lower.map(legacy_lookup).fillna("")
         legacy_mat = legacy_via_ext.where(legacy_via_ext   != "", legacy_via_name)
         legacy_mat = legacy_mat.where(legacy_mat           != "", legacy_via_child)
+        # Match-key audit trail: which lookup key produced the value
+        legacy_match_key = pd.Series([""] * n, index=idx, dtype=object)
+        legacy_match_key = legacy_match_key.mask(legacy_via_ext  != "", ext_lower)
+        legacy_match_key = legacy_match_key.mask(
+            (legacy_via_ext == "") & (legacy_via_name != ""), name_lower
+        )
+        legacy_match_key = legacy_match_key.mask(
+            (legacy_via_ext == "") & (legacy_via_name == "") & (legacy_via_child != ""),
+            name_child_lower,
+        )
     else:
-        legacy_mat = pd.Series([""] * n, index=idx, dtype=object)
+        legacy_mat       = pd.Series([""] * n, index=idx, dtype=object)
+        legacy_match_key = pd.Series([""] * n, index=idx, dtype=object)
     legacy_lower = legacy_mat.str.lower()
     has_legacy   = legacy_lower != ""
 
@@ -528,13 +540,19 @@ def analyze_dataframe(
     # Parallel cross-reference to Legacy ERP. Tried in order: full Name,
     # then the matrix-child portion of Name (text after the last colon)
     # so matrix items in NetSuite ("PARENT:CHILD") match Catsy rows that
-    # store only the child SKU.
+    # store only the child SKU. Also surfaces the matched key.
     if catsy_lookup:
         catsy_via_name  = name_lower.map(catsy_lookup).fillna("")
         catsy_via_child = name_child_lower.map(catsy_lookup).fillna("")
         catsy_mat = catsy_via_name.where(catsy_via_name != "", catsy_via_child)
+        catsy_match_key = pd.Series([""] * n, index=idx, dtype=object)
+        catsy_match_key = catsy_match_key.mask(catsy_via_name != "", name_lower)
+        catsy_match_key = catsy_match_key.mask(
+            (catsy_via_name == "") & (catsy_via_child != ""), name_child_lower
+        )
     else:
-        catsy_mat = pd.Series([""] * n, index=idx, dtype=object)
+        catsy_mat       = pd.Series([""] * n, index=idx, dtype=object)
+        catsy_match_key = pd.Series([""] * n, index=idx, dtype=object)
     catsy_lower = catsy_mat.str.lower()
     has_catsy   = catsy_lower != ""
 
@@ -1179,7 +1197,9 @@ def analyze_dataframe(
     result["flag_is_bb_part"]                 = is_bb_flag.astype(bool)
     result["flag_unknown_composition"]        = flag_unknown_composition.astype(bool)
     result["legacy_material"]                 = legacy_mat
+    result["legacy_match_key"]                = legacy_match_key
     result["catsy_material"]                  = catsy_mat
+    result["catsy_match_key"]                 = catsy_match_key
     result["catsy_vs_netsuite"]               = catsy_vs_netsuite
     result["recommended_material"]            = recommended_mat
     result["expected_material_from_name"]     = expected_mat
@@ -1255,7 +1275,9 @@ _FRIENDLY_NAMES: dict[str, str] = {
     "flag_unknown_composition":        "Unknown Composition",
     "any_flag":                        "Has Issue",
     "legacy_material":                 "Legacy ERP Material",
+    "legacy_match_key":                "Legacy Match Key",
     "catsy_material":                  "Catsy PIM Material",
+    "catsy_match_key":                 "Catsy Match Key",
     "catsy_vs_netsuite":               "Catsy vs NetSuite",
     "recommended_material":            "Recommended Material",
     "expected_material_from_name":     "Suffix-Detected Material",
@@ -1293,7 +1315,8 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
                 pass
 
     # ── Column ordering ────────────────────────────────────────────────────
-    derived_cols   = ["legacy_material", "catsy_material", "catsy_vs_netsuite",
+    derived_cols   = ["legacy_material", "legacy_match_key",
+                      "catsy_material", "catsy_match_key", "catsy_vs_netsuite",
                       "recommended_material",
                       "expected_material_from_name", "matched_signal",
                       "confidence", "suggested_fix", "analysis_notes"]
@@ -1418,7 +1441,8 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
         ("Clean Records",           f"{total - flagged:,}"),
         ("Issue Rate",              f"{flagged / total * 100:.1f}%" if total else "—"),
     ]
-    # Surface legacy match coverage when a legacy ERP cross-check was applied
+    # Surface legacy match coverage when a legacy ERP cross-check was applied,
+    # with a breakdown of which lookup method actually fired.
     if "legacy_material" in df.columns:
         legacy_matches = int((df["legacy_material"] != "").sum())
         if legacy_matches > 0:
@@ -1426,6 +1450,18 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
             summary_rows.append(
                 ("Legacy ERP Matches", f"{legacy_matches:,}  ({cov:.1f}%)")
             )
+            if "legacy_match_key" in df.columns and "External ID" in df.columns:
+                ext_lower  = df["External ID"].astype(str).str.strip().str.lower()
+                name_lower = df["Name"].astype(str).str.strip().str.lower()
+                child_lower = name_lower.str.rsplit(":", n=1).str[-1].str.strip()
+                key = df["legacy_match_key"]
+                matched = key != ""
+                via_ext   = int((matched & (key == ext_lower)).sum())
+                via_name  = int((matched & (key != ext_lower) & (key == name_lower)).sum())
+                via_child = int((matched & (key != ext_lower) & (key != name_lower) & (key == child_lower)).sum())
+                summary_rows.append(("   via External ID",   f"{via_ext:,}"))
+                summary_rows.append(("   via Name",          f"{via_name:,}"))
+                summary_rows.append(("   via Matrix Child",  f"{via_child:,}"))
     # Same for Catsy PIM cross-check
     if "catsy_material" in df.columns:
         catsy_matches = int((df["catsy_material"] != "").sum())
@@ -1434,6 +1470,15 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
             summary_rows.append(
                 ("Catsy PIM Matches", f"{catsy_matches:,}  ({cov:.1f}%)")
             )
+            if "catsy_match_key" in df.columns and "Name" in df.columns:
+                name_lower = df["Name"].astype(str).str.strip().str.lower()
+                child_lower = name_lower.str.rsplit(":", n=1).str[-1].str.strip()
+                key = df["catsy_match_key"]
+                matched   = key != ""
+                via_name  = int((matched & (key == name_lower)).sum())
+                via_child = int((matched & (key != name_lower) & (key == child_lower)).sum())
+                summary_rows.append(("   via Name",          f"{via_name:,}"))
+                summary_rows.append(("   via Matrix Child",  f"{via_child:,}"))
     summary_rows += [
         ("", ""),
         ("Issue Breakdown (a single row may be counted in multiple lines)", "Count"),
@@ -1493,7 +1538,8 @@ def _write_data_sheet_xlsx(ws, df: pd.DataFrame, fmt: dict, on_chunk_written) ->
         elif col_idx in flag_positions:
             ws.set_column(col_idx, col_idx, 16, fmt["center"])
         elif c in ("recommended_material", "expected_material_from_name",
-                   "legacy_material", "catsy_material"):
+                   "legacy_material", "catsy_material",
+                   "legacy_match_key", "catsy_match_key"):
             ws.set_column(col_idx, col_idx, 26)
         elif c == "matched_signal":
             ws.set_column(col_idx, col_idx, 45, fmt["notes"])
