@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.12.4"
+__version__ = "1.12.5"
 
 try:
     import xlsxwriter
@@ -1288,7 +1288,13 @@ _FRIENDLY_NAMES: dict[str, str] = {
 }
 
 
-def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> None:
+def export_excel(
+    df: pd.DataFrame,
+    output_path: str,
+    progress_callback=None,
+    legacy_lookup: dict[str, str] | None = None,
+    catsy_lookup:  dict[str, str] | None = None,
+) -> None:
     """
     Stream a formatted .xlsx report to disk using xlsxwriter.
 
@@ -1299,6 +1305,12 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
         applied via Excel conditional formatting rules instead
       • boolean flag columns are converted to "YES"/"—" strings in pandas
         (vectorized) before writing, so no second pass is needed
+
+    When legacy_lookup / catsy_lookup are provided, the workbook also
+    includes "Unmatched Legacy" / "Unmatched Catsy" sheets listing the
+    cross-reference entries that never matched any NetSuite row — i.e.
+    parts that exist in the external source but are missing from
+    NetSuite.
     """
     if not EXCEL_AVAILABLE:
         print(
@@ -1398,11 +1410,36 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
         }),
     }
 
-    _write_summary_sheet_xlsx(wb, df, fmt)
+    # Pre-compute unmatched-cross-reference dataframes so the Summary tab can
+    # cite the counts AND so we can write them as dedicated sheets.
+    unmatched_catsy_df  = _build_unmatched_xref_df(df, "catsy_match_key",  catsy_lookup)
+    unmatched_legacy_df = _build_unmatched_xref_df(df, "legacy_match_key", legacy_lookup)
+
+    _write_summary_sheet_xlsx(
+        wb, df, fmt,
+        legacy_lookup=legacy_lookup,
+        catsy_lookup=catsy_lookup,
+        unmatched_legacy_count=(len(unmatched_legacy_df) if unmatched_legacy_df is not None else None),
+        unmatched_catsy_count =(len(unmatched_catsy_df)  if unmatched_catsy_df  is not None else None),
+    )
 
     for sheet_name, sub_df, _ in sheet_plan:
         ws = wb.add_worksheet(sheet_name)
         _write_data_sheet_xlsx(ws, sub_df, fmt, on_chunk_written)
+
+    # Audit sheets: rows that exist in the cross-reference source but never
+    # matched any NetSuite row. Lets the user see exactly what's "in Catsy
+    # but missing from NetSuite" (or the same for Legacy ERP).
+    if unmatched_catsy_df is not None and len(unmatched_catsy_df) > 0:
+        report(0.97, f"Writing Unmatched Catsy sheet ({len(unmatched_catsy_df):,} rows)…")
+        ws = wb.add_worksheet("Unmatched Catsy")
+        _write_unmatched_sheet(ws, unmatched_catsy_df, fmt,
+                               source_label="Catsy", key_col="Item")
+    if unmatched_legacy_df is not None and len(unmatched_legacy_df) > 0:
+        report(0.98, f"Writing Unmatched Legacy sheet ({len(unmatched_legacy_df):,} rows)…")
+        ws = wb.add_worksheet("Unmatched Legacy")
+        _write_unmatched_sheet(ws, unmatched_legacy_df, fmt,
+                               source_label="Legacy ERP", key_col="Part Number")
 
     report(0.99, "Saving file…")
     wb.close()
@@ -1410,7 +1447,47 @@ def export_excel(df: pd.DataFrame, output_path: str, progress_callback=None) -> 
     print(f"\nExcel report saved to: {output_path}")
 
 
-def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
+def _build_unmatched_xref_df(
+    df: pd.DataFrame, match_key_col: str, lookup: dict[str, str] | None,
+) -> pd.DataFrame | None:
+    """Return a DataFrame of cross-reference entries that never matched any
+    NetSuite row. None when no lookup was provided."""
+    if not lookup or match_key_col not in df.columns:
+        return None
+    used = set(df[match_key_col].astype(str)) - {""}
+    unused_keys = [k for k in lookup if k not in used]
+    if not unused_keys:
+        # Return an empty frame to signal "lookup was provided, but 100%
+        # matched" — the caller still surfaces this in summary numbers.
+        return pd.DataFrame(columns=["Key", "Material"])
+    return pd.DataFrame(
+        [(k, lookup[k]) for k in unused_keys],
+        columns=["Key", "Material"],
+    )
+
+
+def _write_unmatched_sheet(ws, sub_df: pd.DataFrame, fmt: dict,
+                           source_label: str, key_col: str) -> None:
+    """Write an 'Unmatched <Source>' audit sheet (Key | Material)."""
+    headers = [key_col, "Primary Material" if source_label == "Catsy" else "Material"]
+    ws.write_row(0, 0, headers, fmt["header"])
+    ws.set_row(0, 28)
+    ws.freeze_panes(1, 0)
+    ws.set_column(0, 0, 32)
+    ws.set_column(1, 1, 28)
+    for i, (k, m) in enumerate(sub_df.itertuples(index=False, name=None), 1):
+        ws.write_row(i, 0, (k, m))
+    if len(sub_df) > 0:
+        ws.autofilter(0, 0, len(sub_df), 1)
+
+
+def _write_summary_sheet_xlsx(
+    wb, df: pd.DataFrame, fmt: dict,
+    legacy_lookup: dict[str, str] | None = None,
+    catsy_lookup:  dict[str, str] | None = None,
+    unmatched_legacy_count: int | None = None,
+    unmatched_catsy_count:  int | None = None,
+) -> None:
     ws = wb.add_worksheet("Summary")
     ws.set_column(0, 0, 50)
     ws.set_column(1, 1, 18)
@@ -1442,10 +1519,11 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
         ("Issue Rate",              f"{flagged / total * 100:.1f}%" if total else "—"),
     ]
     # Surface legacy match coverage when a legacy ERP cross-check was applied,
-    # with a breakdown of which lookup method actually fired.
+    # with a breakdown of which lookup method actually fired AND how many
+    # legacy entries went unused (i.e. parts in Legacy but not in NetSuite).
     if "legacy_material" in df.columns:
         legacy_matches = int((df["legacy_material"] != "").sum())
-        if legacy_matches > 0:
+        if legacy_matches > 0 or legacy_lookup:
             cov = legacy_matches / total * 100 if total else 0.0
             summary_rows.append(
                 ("Legacy ERP Matches", f"{legacy_matches:,}  ({cov:.1f}%)")
@@ -1462,10 +1540,17 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
                 summary_rows.append(("   via External ID",   f"{via_ext:,}"))
                 summary_rows.append(("   via Name",          f"{via_name:,}"))
                 summary_rows.append(("   via Matrix Child",  f"{via_child:,}"))
+            if legacy_lookup is not None:
+                total_legacy = len(legacy_lookup)
+                used_legacy  = total_legacy - (unmatched_legacy_count or 0)
+                summary_rows.append(("Legacy entries loaded",  f"{total_legacy:,}"))
+                summary_rows.append(("   used (matched a NetSuite row)",  f"{used_legacy:,}"))
+                summary_rows.append(("   unused (in Legacy, not in NetSuite)",
+                                     f"{unmatched_legacy_count or 0:,}"))
     # Same for Catsy PIM cross-check
     if "catsy_material" in df.columns:
         catsy_matches = int((df["catsy_material"] != "").sum())
-        if catsy_matches > 0:
+        if catsy_matches > 0 or catsy_lookup:
             cov = catsy_matches / total * 100 if total else 0.0
             summary_rows.append(
                 ("Catsy PIM Matches", f"{catsy_matches:,}  ({cov:.1f}%)")
@@ -1479,6 +1564,13 @@ def _write_summary_sheet_xlsx(wb, df: pd.DataFrame, fmt: dict) -> None:
                 via_child = int((matched & (key != name_lower) & (key == child_lower)).sum())
                 summary_rows.append(("   via Name",          f"{via_name:,}"))
                 summary_rows.append(("   via Matrix Child",  f"{via_child:,}"))
+            if catsy_lookup is not None:
+                total_catsy = len(catsy_lookup)
+                used_catsy  = total_catsy - (unmatched_catsy_count or 0)
+                summary_rows.append(("Catsy entries loaded",  f"{total_catsy:,}"))
+                summary_rows.append(("   used (matched a NetSuite row)",   f"{used_catsy:,}"))
+                summary_rows.append(("   unused (in Catsy, not in NetSuite)",
+                                     f"{unmatched_catsy_count or 0:,}"))
     summary_rows += [
         ("", ""),
         ("Issue Breakdown (a single row may be counted in multiple lines)", "Count"),
@@ -1759,7 +1851,10 @@ def run_cli(args) -> None:
             print_flagged_details(df_result, col_name)
 
     if args.excel:
-        export_excel(df_result, args.excel)
+        export_excel(
+            df_result, args.excel,
+            legacy_lookup=legacy_lookup, catsy_lookup=catsy_lookup,
+        )
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
@@ -2166,6 +2261,8 @@ def run_gui() -> None:
                     df_result,
                     str(xlsx_p),
                     progress_callback=make_phase_cb(0.35, 1.0),
+                    legacy_lookup=legacy_lookup,
+                    catsy_lookup=catsy_lookup,
                 )
 
                 total   = len(df_result)
@@ -2179,15 +2276,21 @@ def run_gui() -> None:
                 ]
                 if legacy_lookup is not None:
                     pct_match = legacy_match_count / total * 100 if total else 0.0
+                    used_keys = set(df_result["legacy_match_key"].astype(str)) - {""}
+                    unused = len(legacy_lookup) - len(used_keys)
                     lines.append(
                         f"Legacy match:   {legacy_match_count:,} of {total:,} "
-                        f"({pct_match:.1f}%)"
+                        f"NetSuite ({pct_match:.1f}%);  "
+                        f"{unused:,} of {len(legacy_lookup):,} Legacy entries unused"
                     )
                 if catsy_lookup is not None:
                     pct_match = catsy_match_count / total * 100 if total else 0.0
+                    used_keys = set(df_result["catsy_match_key"].astype(str)) - {""}
+                    unused = len(catsy_lookup) - len(used_keys)
                     lines.append(
                         f"Catsy match:    {catsy_match_count:,} of {total:,} "
-                        f"({pct_match:.1f}%)"
+                        f"NetSuite ({pct_match:.1f}%);  "
+                        f"{unused:,} of {len(catsy_lookup):,} Catsy entries unused"
                     )
                 lines += ["", "Issue breakdown:"]
                 for col, label in FLAG_META.items():
