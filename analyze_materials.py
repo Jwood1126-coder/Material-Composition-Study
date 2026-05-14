@@ -44,7 +44,7 @@ if sys.stderr is None:
 
 import pandas as pd
 
-__version__ = "1.12.5"
+__version__ = "1.12.6"
 
 try:
     import xlsxwriter
@@ -307,19 +307,24 @@ def build_legacy_lookup(legacy_df: pd.DataFrame) -> dict[str, str]:
     pn = (legacy_df[pn_col].fillna("").astype(str).str.strip())
     mat = (legacy_df[mat_col].fillna("").astype(str).str.strip())
 
+    # Load every part-number row, INCLUDING those with no material value.
+    # Blank-material entries are stored with material="" so the analyzer can
+    # distinguish "Legacy has no entry for this part" from "Legacy has the
+    # part but no material" — both useful signals for a reconciliation.
     lookup: dict[str, str] = {}
     skipped_blank = 0
     conflicts = 0
     for raw_p, raw_m in zip(pn, mat):
-        if raw_p in _LEGACY_SENTINELS or raw_m in _LEGACY_SENTINELS:
+        # Sentinel/blank part-number → skip the row entirely
+        if not raw_p or raw_p in _LEGACY_SENTINELS:
             skipped_blank += 1
             continue
-        if not raw_p or not raw_m:
-            skipped_blank += 1
-            continue
+        # Sentinel material → treat as blank (keep the entry)
+        if raw_m in _LEGACY_SENTINELS:
+            raw_m = ""
         key = raw_p.lower()
         if key in lookup:
-            if lookup[key].lower() != raw_m.lower():
+            if raw_m and lookup[key] and lookup[key].lower() != raw_m.lower():
                 conflicts += 1
             # First-occurrence wins — don't overwrite
             continue
@@ -327,8 +332,8 @@ def build_legacy_lookup(legacy_df: pd.DataFrame) -> dict[str, str]:
 
     if not lookup:
         raise ValueError(
-            "Legacy ERP CSV produced 0 usable (Part Number, Material) pairs — "
-            "every row was blank or a placeholder."
+            "Legacy ERP CSV produced 0 usable Part Number entries — "
+            "every row had a blank or placeholder part number."
         )
     return lookup
 
@@ -375,12 +380,17 @@ def build_catsy_lookup(catsy_df: pd.DataFrame) -> dict[str, str]:
     pn  = catsy_df[item_col].fillna("").astype(str).str.strip()
     mat = catsy_df[mat_col].fillna("").astype(str).str.strip()
 
+    # Load every Items row, INCLUDING those with no Primary Material value.
+    # Blank-material entries are kept (stored as "") so the analyzer can
+    # tell apart "Catsy has no entry for this part" from "Catsy has the
+    # part but no material" — the latter is an opportunity to enrich
+    # Catsy from NetSuite.
     lookup: dict[str, str] = {}
     for raw_p, raw_m in zip(pn, mat):
-        if raw_p in _LEGACY_SENTINELS or raw_m in _LEGACY_SENTINELS:
+        if not raw_p or raw_p in _LEGACY_SENTINELS:
             continue
-        if not raw_p or not raw_m:
-            continue
+        if raw_m in _LEGACY_SENTINELS:
+            raw_m = ""
         key = raw_p.lower()
         if key in lookup:
             continue        # first-occurrence wins
@@ -388,8 +398,8 @@ def build_catsy_lookup(catsy_df: pd.DataFrame) -> dict[str, str]:
 
     if not lookup:
         raise ValueError(
-            "Catsy CSV produced 0 usable (Items, Primary Material) pairs — "
-            "every row was blank or a placeholder."
+            "Catsy CSV produced 0 usable Items entries — "
+            "every row had a blank or placeholder Items value."
         )
     return lookup
 
@@ -512,73 +522,105 @@ def analyze_dataframe(
 
     # ── Legacy ERP lookup ──────────────────────────────────────────────────
     # Tried in order: External ID, full Name, matrix-child portion of Name.
-    # Also surfaces the key that actually matched (for audit transparency).
+    # Tracked separately:
+    #   has_legacy_entry — part is present in the legacy lookup
+    #                      (regardless of whether its material is blank)
+    #   has_legacy       — legacy lookup returned a non-blank material
+    # The material-based has_legacy is what gates the issue-flag logic;
+    # has_legacy_entry is used for orphan/coverage stats and the
+    # match-key audit column.
     if legacy_lookup:
         ext_lower  = ext_id.str.lower()
+        present_ext   = ext_lower.isin(legacy_lookup)
+        present_name  = name_lower.isin(legacy_lookup)
+        present_child = name_child_lower.isin(legacy_lookup)
         legacy_via_ext   = ext_lower.map(legacy_lookup).fillna("")
         legacy_via_name  = name_lower.map(legacy_lookup).fillna("")
         legacy_via_child = name_child_lower.map(legacy_lookup).fillna("")
-        legacy_mat = legacy_via_ext.where(legacy_via_ext   != "", legacy_via_name)
-        legacy_mat = legacy_mat.where(legacy_mat           != "", legacy_via_child)
-        # Match-key audit trail: which lookup key produced the value
+        # Material: prefer External ID match, then full Name, then matrix child.
+        # The .where condition uses presence (not the material value) so that
+        # a blank-material legacy entry still "wins" the priority slot.
+        legacy_mat = legacy_via_ext.where(present_ext, legacy_via_name.where(
+            present_name, legacy_via_child.where(present_child, "")
+        ))
+        has_legacy_entry = present_ext | present_name | present_child
+        # Match-key audit trail: which lookup key produced the entry
         legacy_match_key = pd.Series([""] * n, index=idx, dtype=object)
-        legacy_match_key = legacy_match_key.mask(legacy_via_ext  != "", ext_lower)
+        legacy_match_key = legacy_match_key.mask(present_ext, ext_lower)
         legacy_match_key = legacy_match_key.mask(
-            (legacy_via_ext == "") & (legacy_via_name != ""), name_lower
+            ~present_ext & present_name, name_lower
         )
         legacy_match_key = legacy_match_key.mask(
-            (legacy_via_ext == "") & (legacy_via_name == "") & (legacy_via_child != ""),
-            name_child_lower,
+            ~present_ext & ~present_name & present_child, name_child_lower
         )
     else:
         legacy_mat       = pd.Series([""] * n, index=idx, dtype=object)
         legacy_match_key = pd.Series([""] * n, index=idx, dtype=object)
+        has_legacy_entry = pd.Series([False] * n, index=idx)
     legacy_lower = legacy_mat.str.lower()
     has_legacy   = legacy_lower != ""
 
     # ── Catsy PIM lookup ───────────────────────────────────────────────────
-    # Parallel cross-reference to Legacy ERP. Tried in order: full Name,
-    # then the matrix-child portion of Name (text after the last colon)
-    # so matrix items in NetSuite ("PARENT:CHILD") match Catsy rows that
-    # store only the child SKU. Also surfaces the matched key.
+    # Same dual-tracking as legacy: has_catsy_entry = part is in Catsy at all;
+    # has_catsy = Catsy returned a non-blank material. The latter gates all
+    # the issue-flag logic; the former drives the new Catsy-vs-NetSuite
+    # comparison states that distinguish "Catsy missing material" from
+    # "Not in Catsy".
     if catsy_lookup:
+        present_name  = name_lower.isin(catsy_lookup)
+        present_child = name_child_lower.isin(catsy_lookup)
         catsy_via_name  = name_lower.map(catsy_lookup).fillna("")
         catsy_via_child = name_child_lower.map(catsy_lookup).fillna("")
-        catsy_mat = catsy_via_name.where(catsy_via_name != "", catsy_via_child)
+        catsy_mat = catsy_via_name.where(present_name,
+                    catsy_via_child.where(present_child, ""))
+        has_catsy_entry = present_name | present_child
         catsy_match_key = pd.Series([""] * n, index=idx, dtype=object)
-        catsy_match_key = catsy_match_key.mask(catsy_via_name != "", name_lower)
+        catsy_match_key = catsy_match_key.mask(present_name, name_lower)
         catsy_match_key = catsy_match_key.mask(
-            (catsy_via_name == "") & (catsy_via_child != ""), name_child_lower
+            ~present_name & present_child, name_child_lower
         )
     else:
         catsy_mat       = pd.Series([""] * n, index=idx, dtype=object)
         catsy_match_key = pd.Series([""] * n, index=idx, dtype=object)
+        has_catsy_entry = pd.Series([False] * n, index=idx)
     catsy_lower = catsy_mat.str.lower()
     has_catsy   = catsy_lower != ""
 
     # ── Catsy vs NetSuite raw comparison column ────────────────────────────
-    # Independent of any flag/suppression logic. Lets the user autofilter
-    # directly on "Mismatch", "Catsy blank", "NetSuite blank" without
-    # having to interpret the priority rules. Shows nothing when no Catsy
-    # CSV was loaded (keeps the column unobtrusive in legacy-only runs).
+    # Independent of any flag/suppression logic. Six states let the user
+    # autofilter directly on what action is needed:
+    #
+    #   Match                    both filled, values agree → no action
+    #   Mismatch                 both filled, values differ → reconcile
+    #   NetSuite blank           Catsy filled, NetSuite empty → copy → NetSuite
+    #   Catsy missing material   NetSuite filled, Catsy has the part but
+    #                              no material → copy → Catsy
+    #   Not in Catsy             NetSuite has the part, Catsy doesn't know it
+    #   Both blank               neither has material (Catsy may or may not
+    #                              even have the part — see catsy_match_key)
+    #
+    # Empty string when no Catsy CSV was loaded (column stays unobtrusive
+    # in legacy-only runs).
     ns_filled    = (matc.str.strip() != "")
-    catsy_filled = has_catsy
     if catsy_lookup:
         catsy_vs_netsuite = pd.Series(["—"] * n, index=idx, dtype=object)
         catsy_vs_netsuite = catsy_vs_netsuite.mask(
-            ns_filled & catsy_filled & (matc.str.lower() == catsy_lower), "Match"
+            ns_filled & has_catsy & (matc.str.lower() == catsy_lower), "Match"
         )
         catsy_vs_netsuite = catsy_vs_netsuite.mask(
-            ns_filled & catsy_filled & (matc.str.lower() != catsy_lower), "Mismatch"
+            ns_filled & has_catsy & (matc.str.lower() != catsy_lower), "Mismatch"
         )
         catsy_vs_netsuite = catsy_vs_netsuite.mask(
-            ns_filled & ~catsy_filled, "Catsy blank"
+            ns_filled & ~has_catsy & has_catsy_entry, "Catsy missing material"
         )
         catsy_vs_netsuite = catsy_vs_netsuite.mask(
-            ~ns_filled & catsy_filled, "NetSuite blank"
+            ns_filled & ~has_catsy & ~has_catsy_entry, "Not in Catsy"
         )
         catsy_vs_netsuite = catsy_vs_netsuite.mask(
-            ~ns_filled & ~catsy_filled, "Both blank"
+            ~ns_filled & has_catsy, "NetSuite blank"
+        )
+        catsy_vs_netsuite = catsy_vs_netsuite.mask(
+            ~ns_filled & ~has_catsy, "Both blank"
         )
     else:
         catsy_vs_netsuite = pd.Series([""] * n, index=idx, dtype=object)
@@ -1542,8 +1584,13 @@ def _write_summary_sheet_xlsx(
                 summary_rows.append(("   via Matrix Child",  f"{via_child:,}"))
             if legacy_lookup is not None:
                 total_legacy = len(legacy_lookup)
+                with_mat     = sum(1 for v in legacy_lookup.values() if v)
+                without_mat  = total_legacy - with_mat
                 used_legacy  = total_legacy - (unmatched_legacy_count or 0)
                 summary_rows.append(("Legacy entries loaded",  f"{total_legacy:,}"))
+                summary_rows.append(("   with material",       f"{with_mat:,}"))
+                summary_rows.append(("   without material (blank in Legacy)",
+                                     f"{without_mat:,}"))
                 summary_rows.append(("   used (matched a NetSuite row)",  f"{used_legacy:,}"))
                 summary_rows.append(("   unused (in Legacy, not in NetSuite)",
                                      f"{unmatched_legacy_count or 0:,}"))
@@ -1566,8 +1613,13 @@ def _write_summary_sheet_xlsx(
                 summary_rows.append(("   via Matrix Child",  f"{via_child:,}"))
             if catsy_lookup is not None:
                 total_catsy = len(catsy_lookup)
+                with_mat    = sum(1 for v in catsy_lookup.values() if v)
+                without_mat = total_catsy - with_mat
                 used_catsy  = total_catsy - (unmatched_catsy_count or 0)
                 summary_rows.append(("Catsy entries loaded",  f"{total_catsy:,}"))
+                summary_rows.append(("   with material",      f"{with_mat:,}"))
+                summary_rows.append(("   without material (blank in Catsy)",
+                                     f"{without_mat:,}"))
                 summary_rows.append(("   used (matched a NetSuite row)",   f"{used_catsy:,}"))
                 summary_rows.append(("   unused (in Catsy, not in NetSuite)",
                                      f"{unmatched_catsy_count or 0:,}"))
@@ -2278,19 +2330,31 @@ def run_gui() -> None:
                     pct_match = legacy_match_count / total * 100 if total else 0.0
                     used_keys = set(df_result["legacy_match_key"].astype(str)) - {""}
                     unused = len(legacy_lookup) - len(used_keys)
+                    with_mat = sum(1 for v in legacy_lookup.values() if v)
                     lines.append(
                         f"Legacy match:   {legacy_match_count:,} of {total:,} "
-                        f"NetSuite ({pct_match:.1f}%);  "
-                        f"{unused:,} of {len(legacy_lookup):,} Legacy entries unused"
+                        f"NetSuite ({pct_match:.1f}%)"
+                    )
+                    lines.append(
+                        f"  Legacy entries: {len(legacy_lookup):,} loaded "
+                        f"({with_mat:,} with material, "
+                        f"{len(legacy_lookup)-with_mat:,} blank); "
+                        f"{unused:,} unused"
                     )
                 if catsy_lookup is not None:
                     pct_match = catsy_match_count / total * 100 if total else 0.0
                     used_keys = set(df_result["catsy_match_key"].astype(str)) - {""}
                     unused = len(catsy_lookup) - len(used_keys)
+                    with_mat = sum(1 for v in catsy_lookup.values() if v)
                     lines.append(
                         f"Catsy match:    {catsy_match_count:,} of {total:,} "
-                        f"NetSuite ({pct_match:.1f}%);  "
-                        f"{unused:,} of {len(catsy_lookup):,} Catsy entries unused"
+                        f"NetSuite ({pct_match:.1f}%)"
+                    )
+                    lines.append(
+                        f"  Catsy entries:  {len(catsy_lookup):,} loaded "
+                        f"({with_mat:,} with material, "
+                        f"{len(catsy_lookup)-with_mat:,} blank); "
+                        f"{unused:,} unused"
                     )
                 lines += ["", "Issue breakdown:"]
                 for col, label in FLAG_META.items():
